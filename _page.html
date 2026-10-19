@@ -93,10 +93,12 @@ main{max-width:1120px;margin:0 auto;padding:12px 18px 84px}
 .nm{display:flex;align-items:center;gap:9px;min-width:0}
 /* 台标原图多是 300x180 的长图，硬塞进 20x20 的方框里会被缩成一条，字都看不清；
    这里按高度定尺寸、宽度自适应(最多 40px)，长图也能占满宽度 */
-/* 这些台标是"透明底+白字"，铺在白卡片上等于看不见 —— 像电视 App 那样给个深色底框 */
-.nm img{height:26px;width:auto;max-width:66px;min-width:26px;border-radius:5px;padding:2px 3px;
-  object-fit:contain;background:#23272e;flex:0 0 auto;box-sizing:border-box}
-.nm .ph{width:26px;height:26px;border-radius:5px;background:#23272e;color:#9aa4b2;flex:0 0 auto;
+/* 台标是"透明底+白字/浅色字"，白卡片上会发白看不清：不加底色，
+   改用极细的描边阴影把轮廓勾出来，既清楚又不抢眼 */
+.nm img{height:26px;width:auto;max-width:66px;min-width:26px;border-radius:4px;
+  object-fit:contain;background:transparent;flex:0 0 auto;
+  filter:drop-shadow(0 0 .6px rgba(0,0,0,.75)) drop-shadow(0 1px 1px rgba(0,0,0,.28))}
+.nm .ph{width:26px;height:26px;border-radius:4px;background:transparent;color:#9aa4b2;flex:0 0 auto;
   display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700}
 .nm .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .nsrc{font-size:11px;color:var(--sub);background:var(--bg);border-radius:6px;padding:0 5px;flex:0 0 auto}
