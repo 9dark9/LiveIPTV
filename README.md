@@ -4,7 +4,7 @@
 <h1>LIVE直播源</h1>
 
 <a href="https://github.com/kele551/LiveIPTV/releases" title="点击去下载（GitHub + GitCode 合计 · 实时）"><img alt="Downloads" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fkele551-badge.kele551.workers.dev%2F%3Frepo%3DLiveIPTV%26kind%3Ddownloads&style=flat-square" height="30"></a>
-<a href="https://github.com/kele551/LiveIPTV" title="浏览量 · 实时（hits.sh）"><img alt="浏览量" src="https://hits.sh/github.com/kele551/LiveIPTV.svg?label=views&style=flat-square" height="30"></a>
+<a href="https://github.com/kele551/LiveIPTV" title="浏览量 · GitHub 访问计数 · 实时"><img alt="浏览量" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fkele551-badge.kele551.workers.dev%2F%3Frepo%3DLiveIPTV%26kind%3Dviews&style=flat-square" height="30"></a>
 
 <a href="https://github.com/kele551/LiveIPTV/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square"></a>
 <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-blue?style=flat-square">
