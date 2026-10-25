@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-LIVE直播源 v1.4.0  —— 本机直播源整理与控制台
+LIVE直播源 v1.4.1  —— 本机直播源整理与控制台
 =================================================
 单文件、零第三方依赖（只用 Python 标准库）。作者：海风（kele551）
 仓库：https://github.com/kele551/LiveIPTV
@@ -29,6 +29,7 @@ LIVE直播源 v1.4.0  —— 本机直播源整理与控制台
 
 import argparse
 import concurrent.futures
+import ipaddress
 import json
 import os
 import re
@@ -71,7 +72,7 @@ except Exception:                            # 托盘是可选功能，拿不到
 
 APP_NAME = "LIVE直播源"
 AUTHOR = "海风（kele551）"
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 REPO_URL = "https://github.com/kele551/LiveIPTV"
 
 # 升级包验签公钥（Ed25519，32 字节十六进制）；对应私钥离线保管，不随仓库分发。
@@ -102,6 +103,8 @@ CFG_PATH = BASE / "config.json"
 CACHE_PATH = BASE / "channels.json"
 LOGO_CACHE_PATH = BASE / "logos.json"
 LOG_PATH = BASE / (APP_NAME + ".log")
+FAV_PATH = BASE / "favourites.json"          # 收藏(星标)：落盘在这里，重装/换目录也还在
+EPG_CACHE_PATH = BASE / "epg_cache.json"     # EPG 节目单缓存(6 小时)，重启后不重复抓
 
 # ---------------------------------------------------------------- 配置
 
@@ -307,8 +310,8 @@ DEFAULT_CFG = {
     "open_browser": True,      # 启动后自动打开网页控制台
     "interval_hours": 6,       # 直播源自动更新间隔(小时)
     "backups": 3,              # 每个频道内部探测的候选源数量
-    "keep_sd": True,
-    "min_mbps": 1.5,          # 低于这个码率的频道不显示/不导出（0=不限）；1.1 Mbps 那种基本是转码冒充源           # 无高清源时是否保留标清频道(供用户自行选择)
+    "keep_sd": True,          # 无高清源时是否保留标清频道(供用户自行选择)
+    "min_mbps": 1.5,          # 低于这个码率的频道不显示/不导出（0=不限）；1.1 Mbps 那种基本是转码冒充源
     "filter_junk": True,       # 过滤 DJ/相声/助眠/解说 这类非电视频道
     "hide_local": True,        # 不显示地级市/县级台(名字带地名的那些)，列表只留大台
     "urls_per_channel": 1,     # 每个频道写几条线路(>1 时播放器里会出现同名条目，按需开)
@@ -318,6 +321,9 @@ DEFAULT_CFG = {
     "concurrency": 256,        # 并发探测数(地址已去重，256 路大部分时间在等 IO)
     "epg_url": "",             # EPG 节目单地址(可选)
     "output_path": str(_desktop_dir() / (APP_NAME + ".m3u")),   # 直播源自动更新保存位置
+    # 2026-10-24 用户反馈：不想每次跑完更新就往桌面写一个 M3U。默认关；
+    # 想恢复"更新完自动导出"，把这项改成 True 即可（手动「保存 M3U」不受影响）。
+    "auto_export": False,
     "autostart": False,        # 开机自启
     "task_registered": False,  # 是否已注册计划任务(静默更新直播源)
     "self_update": True,       # 程序自身自动更新(检查到新版本会提示)
@@ -364,6 +370,9 @@ UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.3
       "Accept": "*/*", "Accept-Encoding": "identity"}
 
 
+_LOG_LOCK = threading.Lock()
+
+
 def log(msg):
     line = "[%s] %s" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg)
     print(line, flush=True)
@@ -375,8 +384,10 @@ def log(msg):
             except OSError:
                 pass
             LOG_PATH.rename(old)
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        # 多线程(探测/台标/吞吐复测)同时写会撕开多字节字符，写出半截乱码，加锁串起来
+        with _LOG_LOCK:
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
     except OSError:
         pass
 
@@ -1294,7 +1305,7 @@ def parse_ts_video(data):
     return _VIDEO_STREAM_TYPES.get(stream_type, ""), 0, 0
 
 
-def probe_stream(e, timeout, budget=1.5, max_bytes=2621440):  # noqa: C901
+def probe_stream(e, timeout, budget=1.5, max_bytes=2621440, want_res=True):  # noqa: C901
     """一次连接同时判断：能不能连、是不是真流、能不能拉出画面、真实码率、分辨率。
 
     返回 (ok, ttfb_ms, note, mbps, res_h, speed)：
@@ -1317,6 +1328,9 @@ def probe_stream(e, timeout, budget=1.5, max_bytes=2621440):  # noqa: C901
             return False, 0, "TCP不可达", 0.0, 0, 0.0
     try:
         t0 = time.monotonic()
+        # 整条探测的硬时限：单次 socket 超时管不住"读 1.2MB 分片"那种慢速续传，
+        # 实测有地址单条卡了 131 秒(精选源补测那一步)，把整轮更新拖长。
+        hard = t0 + max(4.0, timeout * 2.0)
         resp = _open(url, timeout)
         ttfb = round((time.monotonic() - t0) * 1000)
         ctype = (resp.headers.get("Content-Type") or "").lower()
@@ -1418,7 +1432,8 @@ def probe_stream(e, timeout, budget=1.5, max_bytes=2621440):  # noqa: C901
         # 测速窗口至少 0.8 秒：命中"同服务器已知速度"时原来只有 0.35 秒，
         # 这段时间还夹着慢启动，测出来的吞吐比真实值低一大截(实测 8M 的台只剩 1M)。
         win = max(budget, 0.8)
-        while total < max_bytes and (t_read <= 0 or time.monotonic() - t_read < win):
+        while (total < max_bytes and time.monotonic() < hard
+               and (t_read <= 0 or time.monotonic() - t_read < win)):
             try:
                 b = resp.read(65536)
             except Exception:
@@ -1426,7 +1441,7 @@ def probe_stream(e, timeout, budget=1.5, max_bytes=2621440):  # noqa: C901
             if not b:
                 reached_eof = True
                 break
-            if not got_wh[1] and len(buf) < RES_STAGES[-1]:
+            if want_res and not got_wh[1] and len(buf) < RES_STAGES[-1]:
                 buf += b[:RES_STAGES[-1] - len(buf)]
             if t_read <= 0:
                 # 第一块只用来认内容(TLS 握手与慢启动都算在这块里)，不计入测速窗口
@@ -1435,7 +1450,7 @@ def probe_stream(e, timeout, budget=1.5, max_bytes=2621440):  # noqa: C901
                 t_read = time.monotonic()
                 continue
             total += len(b)
-            if not got_wh[1] and len(buf) >= RES_STAGES[stage]:
+            if want_res and not got_wh[1] and len(buf) >= RES_STAGES[stage]:
                 stage = min(stage + 1, len(RES_STAGES) - 1)
                 if buf[:4] == b"\x00\x00\x00" or b"ftyp" in buf[:64] or b"styp" in buf[:64]:
                     _c, _w, _h = parse_mp4_video(bytes(buf))
@@ -1450,10 +1465,11 @@ def probe_stream(e, timeout, budget=1.5, max_bytes=2621440):  # noqa: C901
         # 分辨率补读：命中"同服务器已知速度"时测速窗口只有 0.35 秒，10M 的台才 400KB，
         # SPS 还没轮到就收摊了。这里再补读一小段专门找 SPS(最多 1.2 秒 / 1.6MB)，
         # 补读的字节不计入 total，不影响 speed 与码率口径。
-        if not got_wh[1] and not reached_eof:
+        if want_res and not got_wh[1] and not reached_eof:
             t_fix = time.monotonic()
             next_try = len(buf) + 300000
-            while time.monotonic() - t_fix < 1.2 and len(buf) < 1600000:
+            while (time.monotonic() - t_fix < 1.2 and len(buf) < 1600000
+                   and time.monotonic() < hard):
                 try:
                     b = resp.read(65536)
                 except Exception:
@@ -1499,12 +1515,12 @@ def probe_stream(e, timeout, budget=1.5, max_bytes=2621440):  # noqa: C901
         # 真实分辨率：能有主清单 RESOLUTION 就用，没有就从码流里读 SPS。
         # 标称分辨率不可信(实测 "cctv8k" 的源其实是 1080p)，所以只认码流里读出来的。
         codec, _w, _h = got_codec or "", got_wh[0], got_wh[1]
-        if not _h:
+        if want_res and not _h:
             codec, _w, _h = parse_ts_video(bytes(buf)) if buf[:4] == b"\x47" else parse_mp4_video(bytes(buf))
-        if not _h and mediatxt:
+        if want_res and not _h and mediatxt:
             # ① fMP4/CMAF：分片里没有 moov，尺寸在 EXT-X-MAP 的初始化段里
             m = re.search(r'#EXT-X-MAP:.*?URI="([^"]+)"', mediatxt)
-            if m:
+            if m and time.monotonic() < hard:
                 try:
                     iu = urljoin(base_url, m.group(1))
                     with _open(iu, timeout) as ir:
@@ -1517,9 +1533,11 @@ def probe_stream(e, timeout, budget=1.5, max_bytes=2621440):  # noqa: C901
             # ② TS 里这一片恰好没有 SPS(IDR 稀疏/首片被切)：换清单里下一片再试一次
             if not _h:
                 for nxt, _d in _more_segments(mediatxt, base_url, 2):
+                    if time.monotonic() >= hard:
+                        break
                     try:
                         with _open(nxt, timeout) as nr:
-                            nb = nr.read(1200000)
+                            nb = nr.read(600000)
                         c3, w3, h3 = (parse_mp4_video(nb)
                                       if (nb[:4] == b"\x00\x00\x00" or b"ftyp" in nb[:64])
                                       else parse_ts_video(nb))
@@ -1733,6 +1751,53 @@ LOGO_ALIASES = {
 }
 
 
+# ---------------------------------------------------------------- 别名归一(小映射)
+# 同一个台在不同源里叫法不同(英文名 / 简写 / 带后缀)，不归一就会在列表里堆成好几条。
+# 规则：键是 merge_same_name.norm() 归一后的写法，**完全命中才合并**；
+# 不做包含/模糊/拼音猜测 —— 宁可留两条，也不把两个不同的台并成一条。
+CHANNEL_ALIAS = {
+    # 央视海外版 / 付费频道
+    "cctv4europe": "cctv4欧洲",
+    "cctv4europa": "cctv4欧洲",
+    "cctv4america": "cctv4美洲",
+    "cctv5plus": "cctv5+",
+    # 凤凰
+    "phoenixchinese": "凤凰中文",
+    "phoenixinfonews": "凤凰资讯",
+    "phoenixhongkong": "凤凰香港",
+    # TVB / 港台
+    "jade": "翡翠",
+    "tvbjade": "翡翠",
+    "hdjade": "翡翠",
+    "rthktv31": "港台电视31",
+    "rthktv32": "港台电视32",
+    "rthktv33": "港台电视33",
+    "rthktv34": "港台电视34",
+    "rthktv35": "港台电视35",
+    # 澳门
+    "tdmoumun": "澳视澳门",
+    "tdmmacau": "澳视澳门",
+    "lotustv": "莲花",
+    # 台湾
+    "tvbsasia": "tvbs亚洲",
+    "tvbsnews": "tvbs新闻",
+    "ebcnews": "东森新闻",
+    "ebcfinancialnews": "东森财经新闻",
+    "setnews": "三立新闻",
+    "ctinews": "中天新闻",
+    "ctivariety": "中天综合",
+    "ftv": "民视",
+    "ftvnews": "民视新闻",
+    "cts": "华视",
+    "ctsnews": "华视新闻",
+    "ttv": "台视",
+    "ttvnews": "台视新闻",
+    "daai1": "大爱一",
+    "daai2": "大爱二",
+    "goodtv": "好消息",
+}
+
+
 def quality_label(mbps, res_h):
     """一句话画质结论(界面上的角标)：严格按用户的门槛判，不猜。"""
     try:
@@ -1865,6 +1930,8 @@ def _filter_logo(u):
     return u if any(h in u for h in LOGO_OK_HOSTS) else ""
 _LOGO_CACHE = {}              # url -> [unix_ts, ok]
 _LOGO_KIND = {}               # url -> white/dark/color（台标配色，决定要不要垫深色底）
+_LOGO_HASH = {}               # url -> 8×8 分桶指纹（发现"两个台用了同一张图"的错配）
+_LOGO_FP = {}                 # url -> 16×16 灰度细指纹（同一桶内再精确比对）
 _LOGO_BYTES = {}              # url -> (content_type, bytes)  台标本地中转缓存(最多 600 张)
 _LOGO_BYTES_MAX = 600
 LOGO_DIR = BASE / "logos"      # 台标图片本地留档：程序重启后 /logo 也不用再出网
@@ -1886,7 +1953,7 @@ def _save_logo_cache():
     except OSError:
         pass
 
-def _png_pixels(data):
+def _png_pixels(data, ncol=32):
     """极简 PNG 解码：只认 8 位的灰/RGB/调色板/RGBA(台标库实际就这几种)，
     产出 (宽, 高, [(r,g,b,a), ...] 采样后的像素)。解不动返回 None。
     用来判断台标是不是"透明底白图"——那种图放在浅色界面上等于看不见。"""
@@ -1935,7 +2002,7 @@ def _png_pixels(data):
     bpp = max(1, ch * bs)                # PNG 滤波按字节/像素算
     prev = bytearray(stride)
     out = []
-    step = max(1, w // 32)
+    step = max(1, w // ncol)
     p = 0
     for y in range(h):
         if p >= len(raw):
@@ -2000,6 +2067,9 @@ _LOGO_KIND_OVERRIDE = {
     "Phoenix3.png": "color",             # 凤凰香港台：橙色凤凰+白字
     "%E9%BB%84%E9%87%91%E7%BF%A1%E7%BF%A0": "color",  # 黄金翡翠：myTV SUPER 白字台标
     "%E4%BA%9A%E6%B4%B2%E5%89%A7": "color",           # 亚洲剧：Asia Digital Media 彩标
+    # 2026-10-24: CCTV-11 戏曲的台标是"白字+细红线"，彩色像素刚好过了 8% 阈值被判成 color，
+    # 结果在浅色界面上白字几乎看不见。强制按白图处理。
+    "CCTV-11": "white",
 }
 
 # 频道名强制覆盖：上游数据源的频道名跟台标/实际称呼不一致时，在此统一
@@ -2014,6 +2084,125 @@ _LOGO_URL_OVERRIDE = {
     "香港台": "https://raw.githubusercontent.com/wanglindl/TVlogo/master/img/Phoenix3.png",
 }
 
+def logo_hash(data):
+    """粗指纹(8×8 灰度 aHash)：用来发现"两个不同频道用了同一张图"的错配。
+    上游图库确实有这种错误 —— 2026-10-21 用户报「黄金翡翠和亚洲剧台标一致」，
+    实测 CCSH 库里这两个名字是同一张 myTV SUPER 的图(字节不同、画面一模一样)。
+    8×8 只能用来分桶(央视那套"CCTV x"长得都像，光靠它会互相误伤)，细比看 logo_fp。
+    解不出(JPEG 等)返回 ""，这类跳过比对。"""
+    try:
+        got = _png_pixels(data, ncol=64)
+    except Exception:
+        return ""
+    return _hash_from_px(got) if got else ""
+
+
+def _gray_grid(got, nw, nh, bg=128):
+    """把解码后的像素采成 n×n 的灰度网格，返回 (总宽, 网格)。
+
+    透明部分按**中灰(128)**合成，不按白底：台标大半是"透明底白字"，按白底合成后
+    整张图只剩一片 255，两张不同的白字台标指纹就一模一样了(实测会把"江苏苏州文化生活"
+    和"法治天地"判成同一张，然后被去重逻辑误杀)。中灰底让白字有对比度，彩色台标不受影响。"""
+    w, _h, out = got
+    if not out or not w:
+        return 0, []
+    step = max(1, w // 64)
+    cols = len(range(0, w, step))
+    if cols <= 0:
+        return 0, []
+    rows = len(out) // cols
+    if rows <= 0:
+        return 0, []
+    grid = []
+    for gy in range(nh):
+        y = min(rows - 1, gy * rows // nh)
+        for gx in range(nw):
+            x = min(cols - 1, gx * cols // nw)
+            r, g, b, a = out[y * cols + x]
+            bgc = bg * (255 - a)
+            grid.append(((r * a + bgc) // 255 * 299 // 1000
+                         + (g * a + bgc) // 255 * 587 // 1000
+                         + (b * a + bgc) // 255 * 114 // 1000))
+    return w, grid
+
+
+def _hash_from_px(got):
+    """8×8 aHash：把灰度网格按中位数二值化成 64 位，用于分桶。"""
+    _w, gray = _gray_grid(got, 8, 8)
+    if not gray:
+        return ""
+    avg = sum(gray) // len(gray)
+    bits = 0
+    for v in gray:
+        bits = (bits << 1) | (1 if v > avg else 0)
+    return "%016x" % bits
+
+
+def logo_fp(data):
+    """细指纹(32×16 灰度值)：判"两张图是不是同一张画面"。解不出返回 ()。
+    采样密度必须够 —— 央视那套 CCTV1/2/3 只有小号数字不同，用 8×8/16×16 会全部判成同一张。"""
+    try:
+        got = _png_pixels(data, ncol=64)
+    except Exception:
+        return ()
+    if not got:
+        return ()
+    _w, grid = _gray_grid(got, 32, 16)
+    return tuple(grid)
+
+
+def _same_art(a, b):
+    """两枚指纹是不是同一张画面。阈值定得很紧，因为要的是"同一张图"而不是"长得像"：
+    实测(304 张随包台标)−−
+      同一张图(黄金翡翠 / 亚洲剧，上游把一张图挂了两个名字)：max=0   mean=0.00
+      不同频道(CCTV1 / CCTV2 只有小号数字不同)：          max=36  mean=1.12
+      CCTV1 / CCTV6：                                    max=40  mean=1.37
+    所以只有 max≤8 且平均差≤1.5 才算同一张：漏判只是不拦(不影响显示)，
+    误判会白掉正确台标，宁可漏不可错。"""
+    if not a or not b or len(a) != len(b):
+        return False
+    total = 0
+    for x, y in zip(a, b):
+        d = x - y if x > y else y - x
+        if d > 8:
+            return False
+        total += d
+    return total / len(a) <= 1.5
+
+
+def _name_related(a, b):
+    """两个频道名是不是"同一类"(同台不同写法、同城兄弟台)。基于名字相似度判断。
+    实测随包台标里被判"同一张图"的 9 组，除 黄金翡翠/亚洲剧 之外全都是同城兄弟台
+    (江苏苏州文化生活/生活资讯、浙江新闻/浙江公共新闻…)，它们的图本来就该一样，
+    所以相似度够高的直接放过，只拦"名字毫不相干、图却一模一样"的错配。"""
+    import difflib
+    na = a.replace(" ", "")
+    nb = b.replace(" ", "")
+    if not na or not nb:
+        return True
+    if na in nb or nb in na:
+        return True
+    return difflib.SequenceMatcher(None, na, nb).ratio() >= 0.3
+
+
+def logo_props(data, url=""):
+    """一次解码同时拿到 (配色, 分桶指纹, 细指纹)：每张图只解一遍。"""
+    kind = ""
+    if url:
+        for _kw, _v in _LOGO_KIND_OVERRIDE.items():
+            if _kw in url:
+                kind = _v
+                break
+    try:
+        got = _png_pixels(data)
+    except Exception:
+        got = None
+    if not got:
+        return kind, "", ()
+    return ((kind or _kind_from_px(got)), _hash_from_px(got),
+            tuple(_gray_grid(got, 32, 16)[1]))
+
+
 def logo_kind(data, url=""):
     """台标配色归类：white=透明底白图(浅色界面上看不见，得垫深色)、
     dark=深色图形、color=彩图、""=判不出来(PNG 解不动/JPEG 等)。"""
@@ -2022,6 +2211,12 @@ def logo_kind(data, url=""):
             if _kw in url:
                 return _v
     got = _png_pixels(data)
+    if not got:
+        return ""
+    return _kind_from_px(got)
+
+
+def _kind_from_px(got):
     if not got:
         return ""
     _w, _h, px = got
@@ -2068,6 +2263,106 @@ def _enc_url(u):
     return quote(u, safe=":/?#[]@!$&'()*+,;=%~-._")
 
 
+# ---------------------------------------------------------------- 本机接口的落点约束
+# 控制台监听在 127.0.0.1(开局域网时 0.0.0.0)且不带令牌，所以"打开目录""写文件""代抓图片"
+# 这三类有副作用的接口必须自己把落点框死，否则本机任何进程(或浏览器里一个跨源请求)
+# 就能让程序替它开任意文件、在任意目录建目录写文件、或去访问内网地址。
+_PICKED_DIRS = set()          # 用户亲自用「选目录…」选过的目录，由 /api/pickdir 记进来
+
+
+def _allowed_dirs(cfg):
+    """允许被打开/写入的目录根：数据目录、默认导出位置、桌面、用户用「选目录…」选过的目录。
+
+    2026-10-24 复检时这里还带着 tempfile.gettempdir()，等于把整个 %TEMP% 开放成
+    "可写区"—— 页面外的进程 POST /api/export 就能在临时目录里随便建文件夹、写文件
+    （启动目录、下载目录都在别的树下，伤不到，但没必要留这个口子）。
+    程序自己要开的东西都在 BASE / 桌面 / 导出位置里，所以把临时目录从根上去掉。
+    """
+    roots = [BASE, LOGO_DIR, _desktop_dir()]
+    out = []
+    for d in roots + [Path(p) for p in _PICKED_DIRS]:
+        try:
+            if str(d):
+                out.append(Path(d).resolve())
+        except (OSError, ValueError):
+            continue
+    op = str((cfg or {}).get("output_path") or "").strip()
+    if op:
+        try:
+            out.append(Path(op).parent.resolve())
+        except (OSError, ValueError):
+            pass
+    return out
+
+
+def _under_allowed(t, cfg):
+    """t(已 resolve) 是否落在允许范围内：本身就是某个根，或某个根的后代。"""
+    for root in _allowed_dirs(cfg):
+        if t == root or root in t.parents:
+            return True
+    return False
+
+
+def _dir_allowed(target, cfg):
+    """「打开目录」用：必须是**已存在的目录**且在允许范围内。"""
+    if not (target or "").strip():
+        return False
+    try:
+        t = Path(str(target)).resolve()
+    except (OSError, ValueError):
+        return False
+    return t.is_dir() and _under_allowed(t, cfg)
+
+
+def _export_dir_allowed(target, cfg):
+    """「保存 M3U」用：允许指到还没建出来的子目录（导出本来就会 mkdir），
+    但最近的那个**已存在的祖先**必须在允许范围内 —— 这样既保住"存到自选目录的
+    子文件夹"这个正常用法，又不会让用户填一个路径就能在磁盘任意位置开新目录。"""
+    if not (target or "").strip():
+        return False
+    try:
+        t = Path(str(target)).resolve()
+    except (OSError, ValueError):
+        return False
+    if t.exists():
+        return t.is_dir() and _under_allowed(t, cfg)
+    for anc in t.parents:
+        if anc.exists():
+            return anc.is_dir() and _under_allowed(anc, cfg)
+    return False
+
+
+def _host_is_public(host):
+    """域名/IP 解析后全是公网可路由地址才算合格，挡掉回环/私网/链路本地/保留段。"""
+    if not host:
+        return False
+    if host.lower() == "localhost" or host.lower().endswith(".local"):
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return False                      # 解析不出来：当作不可用，别放它过去
+    for it in infos:
+        try:
+            ip = ipaddress.ip_address(it[4][0])
+        except ValueError:
+            return False
+        if not ip.is_global:
+            return False
+    return True
+
+
+def _logo_url_ok(url):
+    """台标代抓的准入：只吃 http(s)，且目标主机必须是公网地址。"""
+    try:
+        p = urlparse(url)
+    except ValueError:
+        return False
+    if p.scheme not in ("http", "https"):
+        return False
+    return _host_is_public(p.hostname)
+
+
 def _check_logo(url, timeout=2):
     """HTTP 200 且响应头几个字节为 PNG/JPEG 魔数才认定为可用台标(防 JSON/HTML 冒充)。
     顺手把图片字节留在内存里，页面走 /logo 直接用，不用第二次出网。
@@ -2079,16 +2374,21 @@ def _check_logo(url, timeout=2):
             if len(_LOGO_BYTES) > _LOGO_BYTES_MAX:
                 _LOGO_BYTES.clear()
             _LOGO_BYTES[url] = ("image/png", body)
-            try:
-                _LOGO_KIND[url] = logo_kind(body, url)
-            except Exception:
-                pass
+            _k, _hs, _fp = logo_props(body, url)
+            if _k:
+                _LOGO_KIND[url] = _k
+            if _hs:
+                _LOGO_HASH[url] = _hs
+            if _fp:
+                _LOGO_FP[url] = _fp
             try:
                 LOGO_DIR.mkdir(parents=True, exist_ok=True)
                 (LOGO_DIR / _logo_file(url)).write_bytes(body)
             except OSError:
                 pass
             return True
+        if not _logo_url_ok(url):
+            return False          # 台标地址指向回环/内网/保留段：不替它出网
         with urllib.request.urlopen(urllib.request.Request(_enc_url(url), headers=UA),
                                     timeout=timeout, context=_SSL_CTX) as r:
             ctype = r.headers.get("Content-Type") or "image/png"
@@ -2099,10 +2399,13 @@ def _check_logo(url, timeout=2):
         if len(_LOGO_BYTES) > _LOGO_BYTES_MAX:
             _LOGO_BYTES.clear()
         _LOGO_BYTES[url] = (ctype, body)
-        try:
-            _LOGO_KIND[url] = logo_kind(body, url)
-        except Exception:
-            pass
+        _k, _hs, _fp = logo_props(body, url)
+        if _k:
+            _LOGO_KIND[url] = _k
+        if _hs:
+            _LOGO_HASH[url] = _hs
+        if _fp:
+            _LOGO_FP[url] = _fp
         try:
             LOGO_DIR.mkdir(parents=True, exist_ok=True)
             (LOGO_DIR / _logo_file(url)).write_bytes(body)
@@ -2280,13 +2583,38 @@ def _lib_fuzzy(rel_lib, sub, cands, url_tpl):
     return url_tpl % quote(best) if best else ""
 
 
-def _resolve_logo_local(name):
-    """在离线图库里按频道名找台标：命中本地文件 = 100% 可用，零出网。
-    返回白名单 URL 或空串。顺序：别名表 -> 原名 -> 常见变体 -> 宽松兜底。"""
-    if not name:
-        return ""
-    lib = "cachemiao"          # 离线图库目录名
-    host = "cachemiao/m3u-logos"
+# 简体 -> 繁体（只收频道名里真会用到的字）。港台频道在图库、台标站里大多只有繁体名：
+# "亚洲剧"在简体名下拿到的是 myTV SUPER 的通用标，改成"亞洲劇台"才是这一台自己的标。
+_TRAD_S2T = {
+    "亚": "亞", "剧": "劇", "黄": "黃", "卫": "衛", "视": "視", "东": "東", "凤": "鳳",
+    "龙": "龍", "广": "廣", "贵": "貴", "济": "濟", "庆": "慶", "云": "雲", "苏": "蘇",
+    "华": "華", "辽": "遼", "宁": "寧", "陕": "陝", "晋": "晉", "内": "內", "粤": "粵",
+    "赣": "贛", "闽": "閩", "鲁": "魯", "沪": "滬", "琼": "瓊", "湾": "灣", "财": "財",
+    "经": "經", "纪": "紀", "录": "錄", "农": "農", "业": "業", "军": "軍", "综": "綜",
+    "艺": "藝", "戏": "戲", "儿": "兒", "动": "動", "画": "畫", "闻": "聞", "乐": "樂",
+    "体": "體", "务": "務", "车": "車", "产": "產", "装": "裝", "游": "遊", "钓": "釣",
+    "鱼": "魚", "宠": "寵", "养": "養", "资": "資", "讯": "訊", "线": "線", "网": "網",
+    "员": "員", "术": "術", "铁": "鐵", "银": "銀", "铜": "銅", "阳": "陽", "阴": "陰",
+    "门": "門", "问": "問", "长": "長", "张": "張", "马": "馬", "鸟": "鳥", "飞": "飛",
+    "轮": "輪", "红": "紅", "绿": "綠", "蓝": "藍", "镇": "鎮", "乡": "鄉", "县": "縣",
+    "区": "區", "园": "園", "书": "書", "学": "學", "汉": "漢", "语": "語", "说": "說",
+    "读": "讀", "讲": "講", "带": "帶", "时": "時", "间": "間", "钟": "鐘", "点": "點",
+    "号": "號", "毕": "畢", "兴": "興", "举": "舉", "办": "辦", "际": "際", "陆": "陸",
+    "岛": "島", "峡": "峽", "湾": "灣", "视": "視", "众": "眾", "亿": "億", "价": "價",
+    "传": "傳", "侨": "僑", "俩": "倆", "仓": "倉", "伞": "傘", "伦": "倫", "伟": "偉",
+}
+
+
+def _trad(s):
+    """简体名 -> 繁体名（没有对应字的原样保留）。"""
+    if not s:
+        return s
+    return "".join(_TRAD_S2T.get(c, c) for c in s)
+
+
+def _logo_cands(name):
+    """频道名 -> 图库里可能用的文件名候选。返回 (cands, n, n2, n3, n4)。
+    央视官方名(CCTV-1 综合)在图库里是 CCTV1.png 这一套；带 HD/台/频道的写法也要试。"""
     n = (name or "").strip()
     cands = [n]
     # 央视官方名 -> 图库文件名。台里改名叫"CCTV-1 综合"了，图库里还是 CCTV1.png 这一套
@@ -2308,6 +2636,22 @@ def _resolve_logo_local(name):
     for v in (n2, n3, n4):
         if v and v not in cands:
             cands.append(v)
+    # 繁体写法再补一轮：港台频道在台标站/图库里基本只收繁体名（亚洲剧 -> 亞洲劇台）
+    for b in list(cands):
+        t = _trad(b)
+        if t != b and t not in cands:
+            cands.append(t)
+    return cands, n, n2, n3, n4
+
+
+def _resolve_logo_local(name):
+    """在离线图库里按频道名找台标：命中本地文件 = 100% 可用，零出网。
+    返回白名单 URL 或空串。顺序：别名表 -> 原名 -> 常见变体 -> 宽松兜底。"""
+    if not name:
+        return ""
+    lib = "cachemiao"          # 离线图库目录名
+    host = "cachemiao/m3u-logos"
+    cands, n, n2, n3, n4 = _logo_cands(name)
     # 别名表也参与变体匹配(原名带 HD/后缀时精确查会 miss，如"凤凰香港 HD"->凤凰香港)
     for v in cands:
         al = LOGO_ALIASES.get(v)
@@ -2356,6 +2700,100 @@ def _resolve_logo_local(name):
     return ""
 
 
+# 本地图库里没有的台标，按名字去这三个白名单库再要一次（实测 200 + 图片魔数才用）。
+# 用户 2026-10-21 报「云南卫视台标不显示」的根因就是：离线库是某次同步的快照，
+# 新出现的频道本地没文件，而当时没有"按名字上网要一次"的兜底，于是一直空着。
+# 命中后 _check_logo 会把图存进 LOGO_DIR，下次直接走本地，不用再出网。
+LOGO_NET_TPLS = (
+    # 用户 2026-10-21 给的台标站（4 万枚，带别名匹配：给"亞洲劇台"能直接对上"亚洲剧"）
+    "https://v.999.team/logo.php?name={n}",
+    "https://cdn.jsdelivr.net/gh/cachemiao/m3u-logos@main/tv/{n}.png",
+    "https://cdn.jsdelivr.net/gh/CCSH/IPTV@main/logo/{n}.png",
+    "https://cdn.jsdelivr.net/gh/fanmingming/live@main/tv/{n}.png",
+    "https://raw.githubusercontent.com/cachemiao/m3u-logos/main/tv/{n}.png",
+    "https://raw.githubusercontent.com/wanglindl/TVlogo/main/img/{n}.png",
+)
+_LOGO_MISS = {}               # 频道名 -> 第一次全库都没找到的时间(6 小时内不再重复找)
+LOGO_MISS_TTL = 6 * 3600
+# 一轮更新里最多出网试这么多次：实测不设上限时，缺图的 100 多个台会把台标这一步
+# 从 2 秒拖到 260 秒(整轮 167s -> 388s)。缺的图每轮补一点，几轮之后就都进本地库了。
+_LOGO_NET_BUDGET = [0]
+LOGO_NET_MAX = 90
+
+
+def _resolve_logo_net(name):
+    """离线库没有时，按名字去白名单图库要一次。返回可用的白名单 URL 或 ""。
+    结果走 _LOGO_CACHE(7 天)，失败记 _LOGO_MISS(6 小时)，避免每轮对着同几个台反复出网。"""
+    if not name:
+        return ""
+    miss = _LOGO_MISS.get(name)
+    if miss and time.time() - miss < LOGO_MISS_TTL:
+        return ""
+    cands, _n, n2, n3, n4 = _logo_cands(name)
+    # 只试最像的几个写法 + 前三个模板(台标站 + 两个 jsDelivr，国内都可达)，别把整张表跑一遍。
+    # 繁体写法必须带上：港台频道在台标站里只认繁体名。
+    probe = []
+    for v in cands[:3] + [_trad(name), _trad(name) + "台"]:
+        if v and v not in probe:
+            probe.append(v)
+    probe = probe[:5]
+    for v in probe:
+        for tpl in LOGO_NET_TPLS[:3]:
+            if _LOGO_NET_BUDGET[0] >= LOGO_NET_MAX:
+                return ""
+            u = tpl.format(n=quote(v))
+            ent = _LOGO_CACHE.get(u)
+            if ent:
+                if time.time() - ent[0] < LOGO_TTL:
+                    if ent[1]:
+                        return u
+                    continue
+            _LOGO_NET_BUDGET[0] += 1
+            ok = _check_logo(u, timeout=1.2)
+            _LOGO_CACHE[u] = [time.time(), ok]
+            if ok:
+                return u
+    _LOGO_MISS[name] = time.time()
+    return ""
+
+
+def _logo_alt(name, avoid_fps):
+    """给"跟别的台共用同一张画面"的频道另找一张图：按繁体/别名写法逐个试台标站。
+    avoid_fps 里已有的画面一律不收。找到返回 (url, kind)，找不到返回 ("", "")。
+    用户 2026-10-21 报「黄金翡翠和亚洲剧台标一致」：简体的"亚洲剧"在库里就是通用
+    myTV SUPER 标，繁体"亞洲劇台"才是这一台自己的标。"""
+    if not name:
+        return "", ""
+    cands, _n, _n2, _n3, _n4 = _logo_cands(name)
+    probe = []
+    for v in [_trad(name), _trad(name) + "台", _trad(name) + "頻道"] + cands[:2]:
+        if v and v not in probe:
+            probe.append(v)
+    for v in probe[:5]:
+        for tpl in LOGO_NET_TPLS[:2]:
+            if _LOGO_NET_BUDGET[0] >= LOGO_NET_MAX:
+                return "", ""
+            u = tpl.format(n=quote(v))
+            got = _logo_from_disk(u)
+            if got is None:
+                _LOGO_NET_BUDGET[0] += 1
+                if not _check_logo(u, timeout=1.5):
+                    continue
+                got = _logo_from_disk(u)
+            if got is None:
+                continue
+            kind, hsum, fp = logo_props(got[1], u)
+            if not fp or not hsum:
+                continue
+            if any(_same_art(fp, x) for x in avoid_fps):
+                continue
+            _LOGO_KIND[u] = kind or ""
+            _LOGO_HASH[u] = hsum
+            _LOGO_FP[u] = fp
+            return u, kind or ""
+    return "", ""
+
+
 def resolve_logo(name, src_logo):
     """台标候选链：离线图库(名字直查，零出网) -> 图库别名 -> 源自带的白名单图。
     全部只出白名单两库，结果必须可验证(本地文件在/网络实测 200)才采用。"""
@@ -2377,6 +2815,10 @@ def resolve_logo(name, src_logo):
                 return u
     # 1) 离线图库直查(优先，秒回且永不出错)
     u = _resolve_logo_local(name)
+    if u:
+        return u
+    # 1.5) 离线库没有这个台：按名字去白名单图库要一次，命中就存盘，下次走本地
+    u = _resolve_logo_net(name)
     if u:
         return u
     # 2) 源自带的台标：只接受白名单两库，且必须能从本地磁盘或网络验证
@@ -2464,6 +2906,7 @@ class Updater:
             "next_self_update": 0, "self_update_msg": "",
             "stats": {"channels": 0, "sources": 0, "live": 0, "hkmt": 0, "by_group": {}},
             "source_stats": {},   # key -> {name, ok, count, ms, url, region}
+            "channels_ready": False,   # 频道缓存是否已读进内存（首屏先出骨架，读完再填列表）
         }
         self.argv = []
 
@@ -2527,16 +2970,45 @@ class Updater:
                             plan.append(cand)
             if not plan:
                 plan = list(urls)
-            for u in plan:
+
+            def _grab(u):
                 try:
                     with urllib.request.urlopen(urllib.request.Request(u, headers=UA),
                                                 timeout=8, context=_SSL_CTX) as r:
                         t = r.read().decode("utf-8", "ignore")
-                    if t and "#EXTINF" in t:
-                        text, used = t, u
-                        break
+                    return t if (t and "#EXTINF" in t) else None
                 except Exception:
-                    continue
+                    return None
+
+            # 前三条候选并发抢，谁先回来用谁：原来是一条一条等，不通的地址每个白等 8 秒，
+            # 一个源就能磨掉半分钟(用户反馈"更新太慢"主要就耗在这里和探测上)。
+            if len(plan) > 1:
+                got = {}
+                _ex = concurrent.futures.ThreadPoolExecutor(max_workers=min(3, len(plan)))
+                try:
+                    futs = {_ex.submit(_grab, u): i for i, u in enumerate(plan[:3])}
+                    for f in concurrent.futures.as_completed(futs):
+                        try:
+                            r_ = f.result()
+                        except Exception:
+                            r_ = None
+                        if r_:
+                            got[futs[f]] = r_
+                            if futs[f] == 0:
+                                break      # 第一个候选就通了，剩下的不用等
+                finally:
+                    _ex.shutdown(wait=False)
+                for i in sorted(got):
+                    text, used = got[i], plan[i]
+                    break
+            for u in plan:
+                if text:
+                    break
+                if len(plan) > 1 and u in plan[:3]:
+                    continue           # 前三候选已经在上面抢过了
+                r_ = _grab(u)
+                if r_:
+                    text, used = r_, u
             n = 0
             es = []
             if text:
@@ -2736,7 +3208,10 @@ class Updater:
         # - 已经有一个地址成功过 → 后面的只做"能不能出画面"的快速确认(0.35s 窗口)
         host_fail, host_ok, host_speed = {}, set(), {}
 
+        durs = []                      # 每个地址花了多久(排查"更新太慢"用)
+
         def work(u):
+            _t = time.monotonic()
             recs = by_url[u]
             hp = hp_of(u)
             with lock:
@@ -2750,7 +3225,8 @@ class Updater:
                     self.state["done"] = counter[0]
                 return
             ok, ttfb, note, mbps, res_h, speed = probe_stream(
-                recs[0], timeout=2.5, budget=(0.35 if hint else 1.5))
+                recs[0], timeout=2.5, budget=(0.35 if hint else 1.5),
+                want_res=not recs[0].get("res"))
             if hint and (not speed or speed < hint):
                 speed = hint
             with lock:
@@ -2778,6 +3254,7 @@ class Updater:
             with lock:
                 counter[0] += 1
                 self.state["done"] = counter[0]
+                durs.append((time.monotonic() - _t, ok))
 
         # 一个线程池跑完：分批建池会让每批都重新起几百个线程，白白多花十几秒
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
@@ -2792,7 +3269,8 @@ class Updater:
             t1 = time.monotonic()
             def work2(u):
                 recs = by_url[u]
-                ok, ttfb, note, mbps, res_h, speed = probe_stream(recs[0], timeout=8, budget=2.5)
+                ok, ttfb, note, mbps, res_h, speed = probe_stream(
+                    recs[0], timeout=8, budget=2.5, want_res=not recs[0].get("res"))
                 if ok:
                     for sl in recs:
                         sl["live"], sl["ttfb"], sl["note"] = True, ttfb, ""
@@ -2815,7 +3293,8 @@ class Updater:
             t2 = time.monotonic()
             def work3(u):
                 recs = by_url[u]
-                ok, ttfb, note, mbps, res_h, speed = probe_stream(recs[0], timeout=8, budget=2.0)
+                ok, ttfb, note, mbps, res_h, speed = probe_stream(
+                    recs[0], timeout=8, budget=2.0, want_res=not recs[0].get("res"))
                 if ok:
                     for sl in recs:
                         sl["live"], sl["ttfb"], sl["note"] = True, ttfb, ""
@@ -2833,6 +3312,12 @@ class Updater:
         n_ok = sum(1 for u in order if by_url[u][0]["live"])
         log("探测完成: %d 个地址里 %d 个能出画面(%.0fs；跳过 %d 个已知不通的、%d 个上次在用)"
             % (len(order), n_ok, time.monotonic() - t0, n_skip, len(prev & set(order))))
+        if durs:
+            _dt = sorted(d for d, _o in durs)
+            _p = lambda q: _dt[min(len(_dt) - 1, int(len(_dt) * q))]   # noqa: E731
+            _slow = sum(1 for d, _o in durs if d >= 2.5)
+            log("  单地址耗时: 中位 %.1fs / 90%% %.1fs / 最慢 %.1fs；%d 个超过 2.5s(失败居多)"
+                % (_p(0.5), _p(0.9), _dt[-1], _slow))
         _save_bad_urls()
 
         # 记下每个服务器的成/败，下一轮直接跳过长期不通的(省时间，也少扰民)
@@ -2853,6 +3338,7 @@ class Updater:
         if not todo:
             return
         self.state.update(phase="解析台标", done=0, total=len(todo))
+        _LOGO_NET_BUDGET[0] = 0         # 每轮给"上网补缺台标"一个额度，防止把整轮拖慢
         cnt = [0]
 
         def one(item):
@@ -2882,12 +3368,81 @@ class Updater:
                     _check_logo(u)
                     kind = _LOGO_KIND.get(u)
                 else:
-                    kind = logo_kind(got[1], u)
+                    kind, hsum, hfp = logo_props(got[1], u)
                     if kind:
                         _LOGO_KIND[u] = kind
+                    if hsum:
+                        _LOGO_HASH[u] = hsum
+                    if hfp:
+                        _LOGO_FP[u] = hfp
             ch["logo_kind"] = kind or ""
+        # 错配拦截：上游图库会把别的台的图挂到这个名字上(实测 CCSH 库里"亚洲剧"和
+        # "黄金翡翠"是同一张 myTV SUPER 的图，字节不同、画面一模一样)。两个不同频道
+        # 用了同一张画面时，只留名字更完整的那个，另一个宁可不显示(界面会退回文字方块)，
+        # 也不显示错的台标。先用 8×8 分桶，再在桶内用 16×16 细指纹确认是不是同一张。
+        items = []
+        for _k, ch in todo:
+            u = ch.get("logo") or ""
+            if not u:
+                continue
+            hsum, hfp = _LOGO_HASH.get(u), _LOGO_FP.get(u)
+            if not hfp:
+                got = _logo_from_disk(u)
+                if got is not None:
+                    _k2, hsum2, hfp2 = logo_props(got[1], u)
+                    hsum = hsum or hsum2
+                    if hsum2:
+                        _LOGO_HASH[u] = hsum2
+                    if hfp2:
+                        _LOGO_FP[u] = hfp2
+                        hfp = hfp2
+            if hfp:
+                items.append((ch, hsum, hfp))
+        kept = {}
+        n_dup = 0
+        blanked = []
+        for ch, hsum, hfp in sorted(items, key=lambda it: (-len(it[0]["name"]), it[0]["name"])):
+            bucket = kept.setdefault(hsum, [])
+            hit = None
+            for ch_b, fp_b in bucket:
+                if not _same_art(hfp, fp_b):
+                    continue
+                # 同一个台的不同写法(翡翠台 / 翡翠台HD、同城兄弟台)共用一张图是对的
+                if _name_related(ch["name"], ch_b["name"]):
+                    continue
+                hit = ch_b
+                break
+            if hit is None:
+                bucket.append((ch, hfp))
+                continue
+            # 先别急着清空：换成繁体/别名再找一次，能拿到"不是同一画面"的真台标就留着
+            avoid = [fp_b for _x2, fp_b in bucket] + [hfp]
+            u2, k2 = _logo_alt(ch["name"], avoid)
+            if u2:
+                ch["logo"], ch["logo_kind"] = u2, k2
+                got2 = _logo_from_disk(u2)
+                fp2 = _LOGO_FP.get(u2)
+                if not fp2 and got2 is not None:
+                    _k3, _h3, fp2 = logo_props(got2[1], u2)
+                if fp2:
+                    bucket.append((ch, fp2))
+                    continue
+            # 名字毫不相干却共用同一张画面 —— 这张图对这俩来说都是错的，
+            # 两边都不显示(界面退回"黄"这种文字方块)，比显示别人的台标强。
+            for _x in (ch, hit):
+                if _x.get("logo"):
+                    _x["logo"], _x["logo_kind"] = "", ""
+                    blanked.append(_x["name"])
+            if hit in bucket:
+                bucket.remove(hit)
+            n_dup = len(blanked)
+        if blanked:
+            log("台标去重: %s(同一张图挂了多个台，宁可不显示)" % "、".join(blanked[:6]))
         n_logo = sum(1 for _, ch in todo if ch["logo"])
-        log("台标解析完成: %d/%d 频道有台标(%.0fs)" % (n_logo, len(todo), time.monotonic() - t_logo0))
+        log("台标解析完成: %d/%d 频道有台标(%.0fs%s%s)"
+            % (n_logo, len(todo), time.monotonic() - t_logo0,
+               "，本轮补图 %d 次" % _LOGO_NET_BUDGET[0] if _LOGO_NET_BUDGET[0] else "",
+               "，拦下 %d 个重复台标" % n_dup if n_dup else ""))
 
     # ---------- 组装 ----------
     @staticmethod
@@ -2963,7 +3518,12 @@ class Updater:
             n = noise.sub("", n)
             n = re.sub(r"[\s·・\-_/()（）\[\]【】]+", "", n)
             n = n.rstrip("台") or n
-            return n
+            # 剥完噪声词后再试一次"央视官方后缀"(CCTV2 财经频道 这种多一层"频道"的写法)
+            m2 = cctv_suffix.match(n)
+            if m2:
+                n = "cctv" + m2.group(1)
+            # 小别名表：只有完全命中才合并(见 CHANNEL_ALIAS 的注释)
+            return CHANNEL_ALIAS.get(n, n)
 
         buckets = {}
         for k, ch in channels.items():
@@ -3072,6 +3632,21 @@ class Updater:
             if len(channels) != n_before:
                 log("同一地址合并: 去掉 %d 个重复频道" % (n_before - len(channels)))
             self.resolve_logos(channels)
+            # 【2026-10-25 缓存守卫】上游整轮挂掉/断网时 finalize 会给一个空字典，以前下面两行
+            # 直接把它覆盖进内存并落盘 —— 好列表被清空，重启也救不回来（load_cache 又是"超期即弃"）。
+            # 判据：本轮为空，或不足上轮一半，就认定"这轮不可信"：保留上轮数据、不落盘、不写 m3u，
+            # 把原因写进 state["error"]（页面顶栏会显示"上次更新失败"），并做 10 分钟退避重试。
+            with self.lock:
+                prev = dict(self.channels or {})
+            why = self.guard_verdict(len(prev), len(channels))
+            if why:
+                self.state["error"] = why + "，已沿用上轮列表"
+                self.state["phase"] = "本轮失败，沿用上轮列表"
+                self.state["next_update"] = time.time() + 600     # 10 分钟后再试，别空转
+                log("缓存守卫: %s —— 保留上轮 %d 个频道，不覆盖缓存" % (why, len(prev)))
+                tray_notify("更新失败，已沿用上轮列表",
+                            "%s（%d 个频道仍在）" % (why, len(prev)))
+                return False
             with self.lock:
                 self.channels = channels
             self.state["stats"] = self.compute_stats(channels)
@@ -3079,7 +3654,8 @@ class Updater:
             self.state["next_update"] = time.time() + self.cfg["interval_hours"] * 3600
             self.state["phase"] = "完成"
             self.save_cache(channels)
-            n, skip = self.write_m3u(self.cfg["output_path"])
+            n, skip = (self.write_m3u(self.cfg["output_path"])
+                       if self.cfg.get("auto_export") else (0, 0))
             st = self.state["stats"]
             cost = time.time() - t0
             log("更新完成: 频道 %d(可用 %d) / 写入源 %d / 港澳台 %d / 跳过失效频道 %d，耗时 %.0fs"
@@ -3100,7 +3676,6 @@ class Updater:
             tray_busy(False)     # 不管成功失败，都换回"三角"
             self.state["updating"] = False
 
-    @staticmethod
     def net_pass(self, channels):
         """更新完再补一轮"只看吞吐"的实测：整轮探测是 64 路并发跑的，
         每路分到的带宽被摊薄，测出来的吞吐普遍偏低(实测同一地址单跑 1126KB/s、
@@ -3151,6 +3726,23 @@ class Updater:
     # 之前漏写 @staticmethod，导致 load_cache() 里 self.compute_stats(self.channels)
     # 抛 TypeError -> 缓存被判定"读取失败" -> 每次启动都误触发全量更新并重探测几百条直播流。
     @staticmethod
+    def guard_verdict(prev_n, new_n):
+        """本轮抓到的列表能不能覆盖上轮 —— 返回空串表示可以，否则给出不覆盖的理由。
+
+        判据（2026-10-25 加，配合 run_once 里的缓存守卫）：
+          * 上轮本来就没数据（首次运行）：无从比较，照旧写入；
+          * 本轮为 0：上游全挂/断网，finalize 会给空字典 —— 不能覆盖；
+          * 本轮不足上轮一半：真掉这么多基本不是"上游删了台"，而是抓取侧出了问题 —— 不能覆盖。
+        """
+        if prev_n <= 0:
+            return ""
+        if new_n <= 0:
+            return "本轮没抓到任何频道"
+        if new_n * 2 < prev_n:
+            return "本轮只剩 %d 个频道（上轮 %d 个），掉得太狠" % (new_n, prev_n)
+        return ""
+
+    @staticmethod
     def compute_stats(channels):
         by_group = {}
         ns = nl = nh = 0
@@ -3164,6 +3756,10 @@ class Updater:
 
     def save_cache(self, channels):
         try:
+            if not channels:
+                # 缓存守卫的最后一道：调用方再传一次空，也不能把盘上的好列表抹掉
+                log("缓存保存跳过: 这次传进来是空列表，保留盘上原有缓存")
+                return
             # 频道名强制覆盖（台标/实际称呼与上游数据源不一致时统一）
             for _old, _new in _CHANNEL_NAME_OVERRIDE.items():
                 if _old in channels:
@@ -3183,6 +3779,7 @@ class Updater:
             log("缓存保存失败: %s" % e)
 
     def load_cache(self):
+        stale = False
         try:
             if not CACHE_PATH.exists():
                 return False
@@ -3190,7 +3787,12 @@ class Updater:
             saved = datetime.fromisoformat(data["saved_at"])
             age_h = (datetime.now() - saved).total_seconds() / 3600
             if age_h > self.cfg["interval_hours"]:
-                return False
+                # 以前这里直接 return False，于是"过期"和"根本没有缓存"一个样：首屏空着干等抓取。
+                # 现在照样把列表读进内存（首屏立刻有台可看），只是返回 False 让调用方补一轮；
+                # 那一轮再失败也清不掉它 —— 见 run_once 里的缓存守卫。
+                log("缓存已过期 %.1f 小时(阈值 %s 小时)：先按旧缓存显示，后台照常重抓"
+                    % (age_h, self.cfg["interval_hours"]))
+                stale = True
             self.channels = data["channels"]
             # 频道名强制覆盖（加载时就改，避免旧缓存名残留）
             for _old, _new in _CHANNEL_NAME_OVERRIDE.items():
@@ -3268,7 +3870,11 @@ class Updater:
                     _n2 += 1
             if _n2:
                 log("台标库扩容补漏: 按新图库找到 %d 个频道的台标" % _n2)
-                self.save_cache(self.channels)
+                # 过期缓存不回写：save_cache 会把 saved_at 刷成现在，旧列表就"看起来新鲜"了
+                if not stale:
+                    self.save_cache(self.channels)
+            if stale:
+                return False        # 数据已读进内存，但告诉调用方"这轮还得重抓"
             return True
         except Exception as e:
             log("缓存加载失败: %s" % e)
@@ -3383,6 +3989,329 @@ class Updater:
             self.stop.wait(30)
 
 
+# ---------------------------------------------------------------- 收藏(星标)
+# 落盘格式：{"items":[{"key":..., "name":...}, ...], "saved_at": ...}
+# key 是频道 key(norm_name 的产物)，name 是显示名，两个都存 —— 上游改名/换 key 之后
+# 还能按名字认回来，不至于收藏"凭空消失"。
+_FAV_LOCK = threading.Lock()
+_FAVS = {"items": [], "keys": set(), "names": set()}
+
+
+def _fav_save():
+    with _FAV_LOCK:
+        items = [dict(it) for it in _FAVS["items"]]
+    try:
+        FAV_PATH.write_text(json.dumps({
+            "items": items,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as e:
+        log("收藏保存失败: %s" % e)
+
+
+def _fav_load():
+    items = []
+    try:
+        if FAV_PATH.exists():
+            d = json.loads(FAV_PATH.read_text(encoding="utf-8"))
+            for it in (d.get("items") or []):
+                if isinstance(it, dict) and it.get("key"):
+                    items.append({"key": str(it["key"]), "name": str(it.get("name") or "")})
+                elif isinstance(it, str) and it:
+                    items.append({"key": it, "name": ""})
+    except Exception as e:
+        log("收藏读取失败(先按空处理): %s" % e)
+    with _FAV_LOCK:
+        _FAVS["items"] = items
+        _FAVS["keys"] = {it["key"] for it in items}
+        names = {norm_name(it["name"]) for it in items if it.get("name")}
+        names.discard("")
+        _FAVS["names"] = names
+    return len(items)
+
+
+def _fav_is(ch):
+    """是不是收藏过：先认 key，再认归一后的名字。"""
+    k = str(ch.get("key") or "")
+    n = norm_name(ch.get("name") or "")
+    with _FAV_LOCK:
+        if k and k in _FAVS["keys"]:
+            return True
+        return bool(n) and n in _FAVS["names"]
+
+
+def _fav_toggle(key, name="", on=None):
+    """星标切换：on=True 收藏 / False 取消 / None 取反。返回 (现在是否收藏, 收藏总数)。"""
+    key = str(key or "")
+    if not key:
+        return False, 0
+    with _FAV_LOCK:
+        cur = any(it["key"] == key for it in _FAVS["items"])
+        want = (not cur) if on is None else bool(on)
+        if want and not cur:
+            _FAVS["items"].append({"key": key, "name": str(name or "")})
+        elif (not want) and cur:
+            _FAVS["items"] = [it for it in _FAVS["items"] if it["key"] != key]
+        _FAVS["keys"] = {it["key"] for it in _FAVS["items"]}
+        names = {norm_name(it["name"]) for it in _FAVS["items"] if it.get("name")}
+        names.discard("")
+        _FAVS["names"] = names
+        total = len(_FAVS["items"])
+    _fav_save()
+    return want, total
+
+
+def _fav_items():
+    with _FAV_LOCK:
+        return [dict(it) for it in _FAVS["items"]]
+
+
+def _fav_keys_of(channels):
+    """收藏 -> 当前频道 key 集合（收藏时记的名字变了也能对上）。"""
+    keys = set()
+    for ch in channels:
+        if _fav_is(ch) and ch.get("key"):
+            keys.add(ch["key"])
+    return keys
+
+
+# ---------------------------------------------------------------- EPG(正在播出)
+# 设计要点：
+#   * 抓取/解析只在后台线程(epg_loop)里做，/api/epg 永远只读内存缓存 —— 不拖慢首屏；
+#   * 缓存 6 小时并落盘 epg_cache.json，重启后 6 小时内不重复抓；
+#   * 抓不到/解析失败一律静默降级：接口 ok=false，界面显示「—」，其它功能照常。
+EPG_TTL = 6 * 3600              # 节目单缓存 6 小时
+EPG_RETRY = 30 * 60             # 抓失败后 30 分钟再试（别一直撞）
+EPG_MAX_BYTES = 32 * 1024 * 1024
+
+_EPG_LOCK = threading.Lock()
+_EPG = {
+    "url": "", "fetched": 0.0, "ok": False, "msg": "未配置 EPG 地址",
+    "progs": {},      # epg 频道 id -> [(开始ts, 结束ts, 节目名), ...]
+    "by_name": {},    # 归一化台名 -> epg 频道 id
+    "count": 0,
+    "next_try": 0.0,
+}
+_EPG_NOISE = re.compile(r"(?i)(hd|fhd|uhd|高清|超清|蓝光|标清|流畅)")
+
+
+def _epg_norm(name):
+    """EPG 台名归一：只用来"对名字"，跟列表里显示什么名字无关。"""
+    n = unicodedata.normalize("NFKC", str(name or "")).lower()
+    n = _EPG_NOISE.sub("", n)
+    n = re.sub(r"[\s·・\-_/()（）\[\]【】:：]+", "", n)
+    n = n.rstrip("台") or n
+    return CHANNEL_ALIAS.get(n, n)
+
+
+def _epg_ts(s):
+    """XMLTV 时间 -> unix 秒。支持 '20261024190000 +0800' / '20261024190000' / ISO。"""
+    t = str(s or "").strip()
+    if not t:
+        return 0
+    m = re.match(r"^(\d{14})\s*([+-]\d{4})?\s*$", t)
+    if m:
+        try:
+            if m.group(2):
+                dt = datetime.strptime(m.group(1) + " " + m.group(2), "%Y%m%d%H%M%S %z")
+            else:
+                dt = datetime.strptime(m.group(1), "%Y%m%d%H%M%S")   # 没写时区 = 本地时间
+            return dt.timestamp()
+        except ValueError:
+            return 0
+    try:
+        return datetime.fromisoformat(t.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0
+
+
+def _epg_hhmm(ts):
+    if not ts:
+        return ""
+    try:
+        return datetime.fromtimestamp(ts).strftime("%H:%M")
+    except (ValueError, OSError, OverflowError):
+        return ""
+
+
+def _epg_parse(raw):
+    """解析 XMLTV：只认 <channel> / <programme> 两层，别的一概忽略。
+    返回 (progs, by_name)；progs 按开始时间升序，方便"找当前节目"。"""
+    import xml.etree.ElementTree as ET
+    progs, by_name = {}, {}
+    root = ET.fromstring(raw)
+    for el in root:
+        if el.tag == "channel":
+            cid = (el.get("id") or "").strip()
+            if not cid:
+                continue
+            for dn in el.findall("display-name"):
+                nm = (dn.text or "").strip()
+                if nm:
+                    by_name.setdefault(_epg_norm(nm), cid)
+            by_name.setdefault(_epg_norm(cid), cid)
+        elif el.tag == "programme":
+            cid = (el.get("channel") or "").strip()
+            st = _epg_ts(el.get("start"))
+            sp = _epg_ts(el.get("stop"))
+            if not cid or not st:
+                continue
+            title = ""
+            for t in el.iter("title"):
+                title = (t.text or "").strip()
+                if title:
+                    break
+            if not title:
+                continue
+            progs.setdefault(cid, []).append((st, sp or (st + 3600), title))
+    for v in progs.values():
+        v.sort(key=lambda x: x[0])
+    return progs, by_name
+
+
+def _epg_fetch(url, timeout=20):
+    req = urllib.request.Request(url, headers=dict(UA, **{"Accept-Encoding": "gzip"}))
+    with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX) as r:
+        raw = r.read(EPG_MAX_BYTES + 1)
+    if len(raw) > EPG_MAX_BYTES:
+        raise ValueError("节目单超过 %d MB，已跳过" % (EPG_MAX_BYTES // 1048576))
+    if raw[:2] == b"\x1f\x8b":      # gzip：.gz 文件、服务器压过的，都按文件魔数判
+        import gzip
+        raw = gzip.decompress(raw)
+    return raw
+
+
+def _epg_snapshot():
+    with _EPG_LOCK:
+        return {"url": _EPG["url"], "fetched": _EPG["fetched"], "ok": _EPG["ok"],
+                "msg": _EPG["msg"], "count": _EPG["count"], "next_try": _EPG["next_try"]}
+
+
+def _epg_save_cache():
+    with _EPG_LOCK:
+        snap = {"url": _EPG["url"], "fetched": _EPG["fetched"],
+                "progs": _EPG["progs"], "by_name": _EPG["by_name"]}
+    try:
+        EPG_CACHE_PATH.write_text(json.dumps(snap, ensure_ascii=False), encoding="utf-8")
+    except (OSError, TypeError) as e:
+        log("EPG 缓存写入失败: %s" % e)
+
+
+def _epg_load_cache(cfg):
+    """启动时复用 6 小时内的盘上缓存（省一次几 MB 的下载）。"""
+    try:
+        url = str(cfg.get("epg_url") or "").strip()
+        if not url or not EPG_CACHE_PATH.exists():
+            return False
+        d = json.loads(EPG_CACHE_PATH.read_text(encoding="utf-8"))
+        if d.get("url") != url:
+            return False
+        fetched = float(d.get("fetched") or 0)
+        if time.time() - fetched > EPG_TTL:
+            return False
+        progs = {k: [tuple(x) for x in v] for k, v in (d.get("progs") or {}).items()}
+        if not progs:
+            return False
+        with _EPG_LOCK:
+            _EPG.update(url=url, fetched=fetched, ok=True, msg="", progs=progs,
+                        by_name=d.get("by_name") or {}, count=len(progs), next_try=0.0)
+        log("EPG: 复用缓存(%d 个频道，%.1f 小时前抓的)" % (len(progs), (time.time() - fetched) / 3600))
+        return True
+    except Exception:
+        return False
+
+
+def epg_refresh(cfg, force=False):
+    """抓一次 XMLTV 并解析进内存缓存。返回 True/False；失败只写日志，不抛异常。"""
+    url = str(cfg.get("epg_url") or "").strip()
+    if not url:
+        with _EPG_LOCK:
+            _EPG.update(url="", ok=False, msg="未配置 EPG 地址", progs={}, by_name={},
+                        fetched=0.0, count=0, next_try=0.0)
+        return False
+    cur = _epg_snapshot()
+    if not force and cur["ok"] and cur["url"] == url and time.time() - cur["fetched"] < EPG_TTL:
+        return True
+    t0 = time.monotonic()
+    try:
+        raw = _epg_fetch(url)
+        progs, by_name = _epg_parse(raw)
+        if not progs:
+            raise ValueError("节目单里没有可用的 <programme>")
+        with _EPG_LOCK:
+            _EPG.update(url=url, fetched=time.time(), ok=True, msg="", progs=progs,
+                        by_name=by_name, count=len(progs), next_try=0.0)
+        _epg_save_cache()
+        log("EPG: 已载入 %d 个频道的节目单(%.1fs)" % (len(progs), time.monotonic() - t0))
+        return True
+    except Exception as e:
+        with _EPG_LOCK:
+            if _EPG["ok"] and _EPG["url"] == url:
+                _EPG["next_try"] = time.time() + EPG_RETRY       # 有旧数据就继续用，别清空
+            else:
+                _EPG.update(url=url, ok=False, msg="EPG 抓取失败: %s" % e, progs={},
+                            by_name={}, fetched=0.0, count=0,
+                            next_try=time.time() + EPG_RETRY)
+        log("EPG 抓取失败(界面显示 —，不影响其它功能): %s" % e)
+        return False
+
+
+def epg_loop(cfg):
+    """后台线程：只在"没抓到 / 过期 / 换了地址"时才去抓，绝不挡首屏。"""
+    try:
+        _epg_load_cache(cfg)
+    except Exception:
+        pass
+    while True:
+        try:
+            url = str(cfg.get("epg_url") or "").strip()
+            cur = _epg_snapshot()
+            need = False
+            if url:
+                if not cur["ok"]:
+                    # 没抓到过：换了地址就立刻试；同一个地址失败后按 next_try 退让
+                    need = (cur["url"] != url) or time.time() >= (cur["next_try"] or 0)
+                elif cur["url"] != url or time.time() - cur["fetched"] > EPG_TTL:
+                    need = True
+            if need:
+                epg_refresh(cfg)
+        except Exception as e:          # 后台线程不许把程序带崩
+            log("EPG 线程异常(已忽略): %s" % e)
+        time.sleep(60)
+
+
+def epg_now(ch, now=None):
+    """一个频道"正在播出"的节目；没有就返回 None(界面显示 —)。"""
+    with _EPG_LOCK:
+        if not _EPG["ok"]:
+            return None
+        progs = _EPG["progs"]
+        by_name = _EPG["by_name"]
+    if not progs:
+        return None
+    now = time.time() if now is None else now
+    cid = ""
+    for nm in (ch.get("name") or "", ch.get("aka") or ""):
+        if not nm:
+            continue
+        cid = by_name.get(_epg_norm(nm), "")
+        if cid:
+            break
+    if not cid:
+        return None
+    for st, sp, title in progs.get(cid) or ():
+        if st > now:                       # 已按开始时间升序，后面的更晚，直接停
+            break
+        if now < sp:
+            dur = max(1, sp - st)
+            return {"t": title, "s": _epg_hhmm(st), "e": _epg_hhmm(sp),
+                    "p": round((now - st) * 100.0 / dur, 1), "s0": int(st), "e0": int(sp)}
+    return None
+
+
+_fav_load()      # 启动即读收藏；文件坏了也只是空列表，不影响其它功能
+
+
 # ---------------------------------------------------------------- 网页控制台
 
 PAGE = r"""<!DOCTYPE html>
@@ -3393,277 +4322,381 @@ PAGE = r"""<!DOCTYPE html>
 <title>LIVE直播源</title>
 <link rel="icon" href="__FAVICON__">
 <style>
+/* ===== 设计令牌（四款软件同一套；LIVE 的主色是"直播红"）===== */
 :root{
-  --accent:#e11d2e; --accent-d:#c21423; --accent-l:#fdecee;
-  --bg:#e4e7ea; --bg1:#f4f6f8; --card:#fff; --txt:#1b1f24; --sub:#6b7280; --line:#e4e8ef;
-  --ok:#16a34a; --warn:#d97706; --bad:#dc2626;
-  --shadow:0 1px 2px rgba(16,24,40,.06),0 8px 24px -12px rgba(16,24,40,.18);
-  --r:14px;
+  --font:"Microsoft YaHei UI","Microsoft YaHei","PingFang SC","Segoe UI",system-ui,sans-serif;
+  --mono:"Cascadia Mono",Consolas,"Courier New",monospace;
+  /* 暗色（默认 = 石墨灰） */
+  --bg:#171a20; --bg-1:#1c2027; --card:#20252d; --card-2:#262d37;
+  --line:#303844; --line-2:#3e4856;
+  --txt:#e7ebf1; --txt-2:#a3aebe; --txt-3:#76818f;
+  --ok:#3ecf8e; --warn:#f0b429; --danger:#f2555a; --info:#4f8cff;
+  --accent:#e5484d; --accent-ink:#230407;
+  --fs-title:20px; --fs-h:14px; --fs-body:13px; --fs-meta:12px; --fs-micro:11px;
+  --r-card:10px; --r-btn:8px; --r-pill:999px;
+  --shadow-1:0 1px 0 rgba(0,0,0,.18); --shadow-2:0 14px 40px rgba(0,0,0,.45);
+  /* 让浏览器原生那部分（滚动条、表单控件、日期弹层）也跟着暗色，
+     不然暗色页面配一条亮色滚动条，看着就像没做完 */
+  color-scheme:dark;
 }
-html[data-theme="dark"]{
-  --bg:#0d1015; --bg1:#161b23; --card:#181d25; --txt:#e8eaee; --sub:#9aa2ae; --line:#252b35;
-  --accent-l:#3a1218; --shadow:0 1px 2px rgba(0,0,0,.4),0 10px 28px -14px rgba(0,0,0,.7);
+html[data-theme="light"]{
+  --bg:#f3f5f9; --bg-1:#e9edf4; --card:#ffffff; --card-2:#f7f9fc;
+  --line:#e2e7ef; --line-2:#d3dae5;
+  --txt:#17202b; --txt-2:#4a5563; --txt-3:#7b8794;
+  --ok:#12a150; --warn:#a86f00; --danger:#d13438; --info:#1a5fd0;
+  --accent:#c62b31; --accent-ink:#fff;
+  --shadow-1:0 1px 0 rgba(16,30,54,.04); --shadow-2:0 18px 40px rgba(20,34,60,.14);
+  color-scheme:light;
 }
 *{box-sizing:border-box}
-/* 底色：顶部近白、往下淡蓝灰，比原来的一片平灰更有层次（卡片仍是纯白，对比更清楚） */
-body{margin:0;background:var(--bg);background-image:linear-gradient(180deg,var(--bg1) 0,var(--bg) 420px);
-  background-repeat:no-repeat;background-attachment:fixed;color:var(--txt);
-  font:14px/1.55 "Segoe UI","Microsoft YaHei UI","Microsoft YaHei",system-ui,-apple-system,sans-serif;
-  -webkit-font-smoothing:antialiased}
-button{font:inherit;cursor:pointer;border:0;background:none;color:inherit}
-input,select{font:inherit;color:inherit}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--txt);
+  font:var(--fs-body)/1.5 var(--font);-webkit-font-smoothing:antialiased}
+button,input,select{font:inherit;color:inherit}
+button{cursor:pointer;border:0;background:none}
 a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:6px}
+::selection{background:color-mix(in srgb,var(--accent) 32%,transparent)}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:var(--line-2);border-radius:8px;border:2px solid var(--bg)}
+::-webkit-scrollbar-track{background:transparent}
+.muted{color:var(--txt-3)}
+.spacer{flex:1}
+.hint{font-size:var(--fs-meta);color:var(--txt-3);line-height:1.6}
+.err{color:var(--danger)}
 
-/* ---------------- 顶栏 ---------------- */
-header{position:sticky;top:0;z-index:30;background:color-mix(in srgb,var(--card) 88%,transparent);
-  backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
-.hbar{max-width:1120px;margin:0 auto;padding:8px 18px;display:flex;align-items:center;gap:12px}
-.logo{width:38px;height:38px;border-radius:0;box-shadow:none;background:transparent;display:block}
-.brand{display:flex;flex-direction:column;line-height:1.15}
-.brand b{font-size:16px;letter-spacing:.2px}
-.brand span{font-size:11px;color:var(--sub)}
-.pill{display:inline-flex;align-items:center;gap:6px;height:26px;padding:0 10px;border-radius:999px;
-  background:var(--bg);border:1px solid var(--line);font-size:12px;color:var(--sub);white-space:nowrap}
-.dot{width:7px;height:7px;border-radius:50%;background:var(--sub)}
-.dot.on{background:var(--ok);box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 18%,transparent)}
+/* ===== 组件：按钮 / 胶囊 / Chip ===== */
+.btn{height:32px;padding:0 12px;border-radius:var(--r-btn);border:1px solid var(--line);
+  background:var(--card-2);color:var(--txt);font-size:var(--fs-meta);display:inline-flex;
+  align-items:center;gap:7px;transition:background .15s,border-color .15s,color .15s}
+.btn:hover{border-color:var(--line-2);background:var(--card)}
+.btn.primary{background:var(--accent);border-color:transparent;color:var(--accent-ink);font-weight:600}
+.btn.primary:hover{filter:brightness(1.07);color:var(--accent-ink)}
+.btn.ghost{background:transparent;border-color:transparent;color:var(--txt-2)}
+.btn.ghost:hover{background:var(--card-2);color:var(--txt)}
+.btn.danger{color:var(--danger);border-color:color-mix(in srgb,var(--danger) 35%,var(--line))}
+.btn.danger:hover{background:color-mix(in srgb,var(--danger) 12%,transparent);color:var(--danger)}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+
+.pill{display:inline-flex;align-items:center;gap:6px;height:26px;padding:0 10px;border-radius:var(--r-pill);
+  border:1px solid var(--line);background:var(--card-2);color:var(--txt-2);font-size:var(--fs-micro);
+  white-space:nowrap}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--txt-3);flex:none}
+.dot.ok{background:var(--ok);box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 18%,transparent)}
 .dot.run{background:var(--accent);animation:blink 1s infinite}
-/* 状态图标跟右下角托盘同款：红圆角方块 + 白三角（空闲） / 白方块（更新中） */
+@keyframes blink{50%{opacity:.25}}
+/* 状态图标跟右下角托盘同款：红圆角方块 + 白三角 / 更新中变白方块 */
 .ti{width:15px;height:15px;border-radius:4.5px;flex:0 0 auto;position:relative;
-  background:linear-gradient(180deg,#f50a38,#c4001a);box-shadow:0 1px 2px rgba(225,29,46,.35)}
+  background:linear-gradient(180deg,#f50a38,#c4001a)}
 .ti::after{content:"";position:absolute;left:5.5px;top:3.5px;width:0;height:0;
   border-left:6px solid #fff;border-top:4px solid transparent;border-bottom:4px solid transparent}
 .ti.run::after{left:4.5px;top:4.5px;width:6px;height:6px;border:0;background:#fff;border-radius:1px}
 .ti.run{animation:blink 1s infinite}
 .ti.off{filter:grayscale(1);opacity:.55}
-@keyframes blink{50%{opacity:.25}}
-.spacer{flex:1}
-.btn{height:32px;padding:0 13px;border-radius:10px;border:1px solid var(--line);background:var(--card);
-  color:var(--txt);font-size:13px;display:inline-flex;align-items:center;gap:6px;transition:.15s}
-.btn:hover{border-color:color-mix(in srgb,var(--accent) 45%,var(--line));color:var(--accent)}
-.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
-.btn.primary:hover{background:var(--accent-d);color:#fff}
-.btn.danger:hover{border-color:var(--bad);color:var(--bad)}
-.btn:disabled{opacity:.5;cursor:not-allowed}
 
-/* 进度条 */
+.chip{height:26px;padding:0 11px;border-radius:var(--r-pill);border:1px solid var(--line);
+  background:transparent;color:var(--txt-2);font-size:var(--fs-meta);display:inline-flex;
+  align-items:center;gap:6px;transition:background .15s,border-color .15s,color .15s}
+.chip:hover{color:var(--txt);border-color:var(--line-2)}
+.chip.on{background:color-mix(in srgb,var(--accent) 14%,transparent);
+  border-color:color-mix(in srgb,var(--accent) 45%,var(--line));color:var(--accent);font-weight:600}
+.chip.fav.on{background:color-mix(in srgb,var(--warn) 16%,transparent);
+  border-color:color-mix(in srgb,var(--warn) 45%,var(--line));color:var(--warn)}
+
+/* ===== 顶栏 ===== */
+header{position:sticky;top:0;z-index:30;background:color-mix(in srgb,var(--bg) 88%,transparent);
+  backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
+.hbar{max-width:1180px;margin:0 auto;padding:10px 20px;display:flex;align-items:center;gap:10px}
+.brandico{width:34px;height:34px;border-radius:9px;display:block;flex:none}
+.brand{display:flex;flex-direction:column;line-height:1.2}
+.brand b{font-size:var(--fs-h);font-weight:650;letter-spacing:.2px}
+.brand span{font-size:var(--fs-micro);color:var(--txt-3)}
 .pwrap{height:3px;background:transparent;overflow:hidden}
 .pwrap.show{background:var(--line)}
-.pbar{height:100%;width:0;background:linear-gradient(90deg,var(--accent),#ff6b7a);transition:width .35s}
+.pbar{height:100%;width:0;background:var(--accent);transition:width .35s}
 
-/* ---------------- 主体 ---------------- */
-main{max-width:1120px;margin:0 auto;padding:12px 18px 62px;display:flex;flex-direction:column;min-height:calc(100vh - 62px)}
-.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:10px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow)}
-.stat{padding:8px 12px}
-.stat b{display:block;font-size:19px;line-height:1.15;font-variant-numeric:tabular-nums}
-.stat span{font-size:11.5px;color:var(--sub)}
-.phase{font-size:12px;color:var(--sub);padding:0 2px 8px;grid-column:1/-1}
+/* ===== 主体 ===== */
+main{max-width:1180px;margin:0 auto;padding:16px 20px 92px;display:flex;flex-direction:column;gap:12px}
 
-.toolbar{padding:9px 12px;display:flex;flex-direction:column;gap:8px}
+/* 合规提示条：只声明"不含内容"，一句话看懂 */
+.legal{display:flex;gap:14px;align-items:center;background:color-mix(in srgb,var(--warn) 10%,var(--card));
+  border:1px solid color-mix(in srgb,var(--warn) 40%,var(--line));border-radius:var(--r-card);padding:12px 14px}
+.legal .lt{font-weight:600;font-size:var(--fs-body);color:var(--warn);white-space:nowrap}
+.legal .ld{flex:1;font-size:var(--fs-meta);line-height:1.6;color:var(--txt-2)}
+.legal[hidden]{display:none !important}
+
+/* 数字卡（StatTile：11px 大写标签 + 24px 数字 + 12px 说明） */
+.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:var(--r-card);
+  padding:14px 16px;box-shadow:var(--shadow-1)}
+.stat .k{font-size:var(--fs-micro);color:var(--txt-3);letter-spacing:.06em}
+/* 【2026-10-25 用户「四个数字的字样要统一」】数字原来单独走 --mono（Cascadia Mono）：
+   "86 / 62 / 48%" 是等宽拉丁字形，"10 分钟前" 里的中文等宽字体根本没有、
+   只能回落到微软雅黑 —— 于是同一张卡里 24px 下混两种字形，四张卡放一起更明显。
+   桌面壁纸、狐径的 .stat .v 用的都是界面字体 + tabular-nums，这里跟它们对齐：
+   字形统一，数字仍等宽对齐（tabular-nums 就够了，不需要整段换等宽字体）。 */
+.stat .v{font-size:24px;font-weight:650;line-height:1.25;margin-top:6px;
+  font-variant-numeric:tabular-nums}
+.stat .v small{font-size:var(--fs-meta);font-weight:500;color:var(--txt-3);margin-left:4px;
+  font-family:var(--font)}
+.stat .d{font-size:var(--fs-micro);color:var(--txt-3);margin-top:4px}
+
+/* 工具条 */
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r-card);box-shadow:var(--shadow-1)}
+.toolbar{padding:12px 14px;display:flex;flex-direction:column;gap:10px}
 .row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.search{flex:1;min-width:180px;height:32px;border:1px solid var(--line);border-radius:10px;
-  background:var(--bg);padding:0 12px;outline:none}
+.search{flex:1;min-width:200px;height:32px;border:1px solid var(--line);border-radius:var(--r-btn);
+  background:var(--card-2);padding:0 12px;outline:none;transition:border-color .15s,background .15s}
 .search:focus{border-color:var(--accent);background:var(--card)}
-.chips{display:flex;gap:6px;flex-wrap:wrap}
-.chip{height:26px;padding:0 10px;border-radius:999px;border:1px solid var(--line);background:transparent;
-  font-size:12.5px;color:var(--sub);transition:.15s}
-.chip:hover{color:var(--txt);border-color:color-mix(in srgb,var(--accent) 35%,var(--line))}
-.chip.on{background:var(--accent-l);border-color:color-mix(in srgb,var(--accent) 40%,var(--line));color:var(--accent);font-weight:600}
-.qsep{width:1px;height:20px;background:var(--line);margin:0 2px}
-
-/* 列表 */
-.list{margin-top:10px;overflow:hidden;flex:1 1 auto;display:flex;flex-direction:column;min-height:0}
-.thead,.tr{display:grid;grid-template-columns:30px 104px minmax(0,1fr) 80px 180px minmax(0,1fr);align-items:center;gap:8px;padding:0 10px}
-.thead{height:32px;font-size:12px;color:var(--sub);border-bottom:1px solid var(--line);background:var(--card)}
-.tbody{flex:1 1 auto;min-height:200px;overflow:auto}   /* 列表拉伸填充，随窗口高度自适应 */
-.tr{height:72px;border-bottom:1px solid color-mix(in srgb,var(--line) 60%,transparent)}
-.tr:hover{background:color-mix(in srgb,var(--accent) 4%,transparent)}
-.tr.dead{opacity:.45}
-.nm{display:flex;align-items:center;gap:9px;min-width:0}
-/* 台标统一排版：所有台标（彩图直显 / 白图垫底）都进同一个 104x40 画框，
-   object-fit:contain 居中——横版(300x180)、竖版(507x597)、宽条(294x77)
-   都完整显示且视觉大小一致，不再撑爆行宽也不被裁切 */
-.nm img{height:40px;width:auto;max-width:104px;min-width:32px;border-radius:5px;
-  object-fit:contain;background:transparent;flex:0 0 auto}
-.lgcol{display:flex;align-items:center;justify-content:center;min-width:0;overflow:hidden}
-/* 表头"台标"两个字与下方居中的台标图对齐 */
-.hlg{text-align:center}
-/* 表头"频道"两个字整体向右内缩一点，避免紧贴台标列显得拥挤 */
-.hch{padding-left:14px}
-.lg{display:flex;align-items:center;justify-content:center;width:104px;height:40px;
-  max-width:104px;min-width:104px;border-radius:6px;flex:0 0 auto;overflow:hidden;padding:0 3px}
-.lg img{width:100%;height:100%;object-fit:contain}
-.lg.dk{background:transparent;box-shadow:none}
-.lg.dk img{filter:brightness(0) saturate(0);opacity:.46}
-.ph{width:26px;height:26px;border-radius:4px;background:transparent;color:#9aa4b2;flex:0 0 auto;
-  display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700}
-.nm .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 auto;min-width:0}
-.nsrc{font-size:11px;color:var(--sub);background:var(--bg);border-radius:6px;padding:0 5px;flex:0 0 auto}
-.grp{font-size:12.5px;color:var(--sub)}
-.qa{display:flex;align-items:center;gap:6px;font-size:12.5px;min-width:0;flex-wrap:nowrap}
-.tag{font-size:11px;font-weight:700;padding:1px 6px;border-radius:6px;background:var(--bg);color:var(--sub);border:1px solid var(--line);flex:0 0 auto}
-.tag.q4{color:#7c3aed;border-color:#ddd6fe;background:#f5f3ff}
-.tag.q3{color:#0369a1;border-color:#bae6fd;background:#f0f9ff}
-.tag.q2{color:#4d7c0f;border-color:#d9f99d;background:#f7fee7}
-.tag.q1{color:#9a3412;border-color:#fed7aa;background:#fff7ed}
-.tag.q0{color:#b91c1c;border-color:#fecaca;background:#fef2f2}
-.spd{font-size:11px;color:var(--sub);font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.cd{font-size:10px;font-weight:700;color:#6b7280;background:var(--bg);border:1px solid var(--line);
-  border-radius:4px;padding:0 4px;flex:0 0 auto;margin-left:2px}
-.net{font-size:10.5px;font-variant-numeric:tabular-nums;border-radius:5px;padding:0 4px;flex:0 0 auto}
-.net.ok{color:#15803d;background:#f0fdf4;border:1px solid #bbf7d0}
-.net.slow{color:#b91c1c;background:#fef2f2;border:1px solid #fecaca}
-.host{font-size:12px;color:var(--sub);display:flex;align-items:center;gap:6px;min-width:0}
-.host .h{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.mini{opacity:0;height:22px;padding:0 8px;border-radius:7px;border:1px solid var(--line);
-  background:var(--card);font-size:11.5px;color:var(--sub);transition:.15s;flex:0 0 auto}
-.tr:hover .mini{opacity:1}
-.mini:hover{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 45%,var(--line))}
-.lowb{font-size:10.5px;color:#b45309;background:#fffbeb;border:1px solid #fde68a;
-  border-radius:5px;padding:0 4px;flex:0 0 auto}
-.lowr{font-size:10.5px;color:#1d4ed8;background:#eff6ff;border:1px solid #bfdbfe;
-  border-radius:5px;padding:0 4px;flex:0 0 auto}
-input[type=checkbox]{width:16px;height:16px;accent-color:var(--accent);cursor:pointer}
-.empty{padding:36px 16px;text-align:center;color:var(--sub);font-size:13px}
-
-/* 底栏 */
-footer{position:fixed;left:0;right:0;bottom:0;z-index:40;background:color-mix(in srgb,var(--card) 94%,transparent);
-  backdrop-filter:blur(10px);border-top:1px solid var(--line)}
-.foot{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;flex-wrap:wrap;
-  margin-top:auto;margin-bottom:0;text-align:center;font-size:11.5px;color:var(--sub);
-  min-height:34px;padding:4px 0;line-height:1.4}
-.foot a{color:var(--sub);text-decoration:none}
-.foot a:hover{color:var(--accent);text-decoration:underline}
-.fbar{max-width:1120px;margin:0 auto;padding:8px 18px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.sel{font-size:13px;color:var(--sub);white-space:nowrap}
-.sel b{color:var(--accent)}
-.field{height:32px;border:1px solid var(--line);border-radius:10px;background:var(--bg);padding:0 10px;outline:none;min-width:0}
+.field{height:32px;border:1px solid var(--line);border-radius:var(--r-btn);background:var(--card-2);
+  padding:0 10px;outline:none;min-width:0}
 .field:focus{border-color:var(--accent);background:var(--card)}
-#outdir{flex:1;min-width:220px}
-#fname{width:150px}
+.sortsel{max-width:270px}
+.chips{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.qsep{width:1px;height:18px;background:var(--line);margin:0 2px}
 
-/* 弹窗 */
-.mask{position:fixed;inset:0;background:rgba(15,18,23,.45);display:none;align-items:center;justify-content:center;
-  z-index:60;padding:20px}
+/* ===== 列表（表格）===== */
+.list{display:flex;flex-direction:column;overflow:hidden;min-height:0}
+.thead,.tr{display:grid;align-items:center;gap:8px;padding:0 12px;
+  grid-template-columns: 26px repeat(6, minmax(0,1fr)) 32px}
+.thead>div{text-align:center;justify-content:center}
+.tr>div{text-align:center}
+.tr>.nm,.tr>.grp,.tr>.qa,.tr>.epg,.tr>.spd{justify-content:center}
+.tr>.c-sel{text-align:left}
+/* 【2026-10-25 用户「居中」】频道格第二行（"N 源"角标 + 域名）居不了中：
+   原来这条规则写的是 .nm .meta，可第二行实际的 class 是 .sub（.meta 是"画质·码率"那格里的），
+   选择器落空 → 频道名居中了、下面那行还贴着左边，看着就是歪的。
+   .sub 是 flex 行，居中的正确写法是 justify-content（text-align 对 flex 子项无效）。 */
+.tr>.nm .sub{justify-content:center}
+.thead>div:first-child{text-align:left}
+.thead{height:32px;font-size:var(--fs-micro);letter-spacing:.05em;color:var(--txt-3);
+  border-bottom:1px solid var(--line);background:var(--card-2);
+  border-radius:var(--r-card) var(--r-card) 0 0}
+/* 亮色下卡片是纯白，表头要用 --bg-1 才压得住（否则表头与行几乎同色，层级发平） */
+html[data-theme="light"] .thead{background:var(--bg-1)}
+.tbody{overflow:auto;max-height:none}
+.tr{height:56px;border-bottom:1px solid color-mix(in srgb,var(--line) 70%,transparent);
+  transition:background .15s}
+/* 表格只画可见区域：屏外的行浏览器先不排版（配合分帧追加，348 行也不会卡首屏） */
+@media(min-width:761px){
+  .tr{content-visibility:auto;contain-intrinsic-size:auto 56px}
+}
+.tr:last-child{border-bottom:0}
+.tr:hover{background:var(--card-2)}
+.tr.dead{opacity:.5}
+.th-r{text-align:right}
+
+/* 台标列：**画框尺寸/位置原样保留**（104x40 一格，居中对齐），
+   改的是"图怎么塞进这一格"：见下面 logoFit —— 先量出台标真正看得见的那块内容，
+   再按内容框缩放定位，所有台标画出来才是同一个大小。
+   量不出来时（跨域/解码失败）退回原来的 object-fit:contain，不会更差。 */
+.lgcol{display:flex;align-items:center;justify-content:center;min-width:0;overflow:hidden}
+.hlg{text-align:center}
+.lg{position:relative;display:block;width:104px;height:40px;
+  max-width:104px;min-width:104px;border-radius:6px;flex:0 0 auto;overflow:hidden;padding:0}
+.lg img.logo{position:absolute;left:0;top:0;width:100%;height:100%;object-fit:contain;border-radius:0}
+/* .fit = 这张图已经量过内容框，尺寸/位置由 logoFit 逐张写在 style 上（等比缩放，fill 不会拉变形） */
+.lg.fit img.logo{object-fit:fill}
+/* 透明底白图（央视全系这类）：放浅色卡上等于看不见。用户 2026-10-21 定：
+   就用 v1.4.0 的样子 —— 不垫底块，白图转成浅灰剪影。
+   2026-10-24 用户又说"台标发灰/发雾"：不改变样子，只把剪影调实一点
+   （透明度 .72→.86 / .66→.80），仍是同一套"不垫底的浅灰剪影"，要退回去改这两个数就行 */
+.lg.dk{background:transparent;box-shadow:none}
+.lg.dk img.logo{filter:brightness(0) saturate(0);opacity:.86}
+/* 暗色下白图剪影必须反过来（黑色剪影落在深色卡上等于没有），
+   仍然只是"浅灰剪影"，不垫底块 —— 台标在两种主题下都看得清 */
+html[data-theme="dark"] .lg.dk img.logo{filter:brightness(0) invert(1);opacity:.8}
+/* 没台标图片时的"字母牌"兜底（logoTile）：高度跟归一后的台标对齐（26px），
+   不然一排台标里混进一个个 30px 的色块，看着就是两副样子 */
+.ph{min-width:26px;height:26px;border-radius:6px;flex:0 0 auto;display:flex;align-items:center;
+  justify-content:center;font-size:9px;font-weight:700;line-height:1;color:#fff;overflow:hidden;padding:0 5px}
+
+.nm{display:flex;flex-direction:column;gap:2px;min-width:0}
+.nm .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:550}
+.nm .sub{display:flex;align-items:center;gap:6px;font-size:var(--fs-micro);color:var(--txt-3);
+  overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.nsrc{font-size:var(--fs-micro);color:var(--txt-2);background:var(--card-2);border:1px solid var(--line);
+  border-radius:5px;padding:0 5px;flex:0 0 auto}
+.grp{font-size:var(--fs-meta);color:var(--txt-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+.qa{display:flex;align-items:center;gap:6px;min-width:0;flex-wrap:nowrap;overflow:hidden}
+.tag{font-size:var(--fs-micro);font-weight:700;padding:1px 6px;border-radius:5px;flex:0 0 auto;
+  background:var(--card-2);color:var(--txt-2);border:1px solid var(--line)}
+.tag.q4{color:#a78bfa;border-color:color-mix(in srgb,#a78bfa 40%,var(--line));
+  background:color-mix(in srgb,#a78bfa 14%,transparent)}
+.tag.q3{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 40%,var(--line));
+  background:color-mix(in srgb,var(--ok) 12%,transparent)}
+.tag.q2{color:var(--info);border-color:color-mix(in srgb,var(--info) 40%,var(--line));
+  background:color-mix(in srgb,var(--info) 12%,transparent)}
+.tag.q1,.tag.q0{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 40%,var(--line));
+  background:color-mix(in srgb,var(--warn) 12%,transparent)}
+html[data-theme="light"] .tag.q4{color:#6d28d9}
+.qa .meta{font-size:var(--fs-micro);color:var(--txt-3);overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;font-variant-numeric:tabular-nums}
+.cd{font-size:var(--fs-micro);font-weight:700;color:var(--txt-2);background:var(--card-2);
+  border:1px solid var(--line);border-radius:5px;padding:0 4px;flex:0 0 auto}
+.lowb,.lowr{font-size:var(--fs-micro);border-radius:5px;padding:0 4px;flex:0 0 auto;
+  border:1px solid color-mix(in srgb,var(--warn) 45%,var(--line));
+  color:var(--warn);background:color-mix(in srgb,var(--warn) 12%,transparent)}
+
+/* 正在播出（EPG） */
+.epg{display:flex;align-items:center;gap:6px;min-width:0;font-size:var(--fs-micro);color:var(--txt-3)}
+.epg b{color:var(--txt-2);font-weight:550;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.epg .tm{flex:0 0 auto;font-variant-numeric:tabular-nums}
+.epg .bar{width:44px;height:3px;border-radius:2px;background:var(--line);overflow:hidden;flex:0 0 auto}
+.epg .bar i{display:block;height:100%;background:var(--accent);border-radius:2px}
+
+/* 速度 */
+.spd{display:flex;align-items:baseline;justify-content:flex-start;gap:4px;
+  font-family:var(--mono);font-variant-numeric:tabular-nums}
+.spd .n{font-size:var(--fs-body);color:var(--ok)}
+.spd .n.slow{color:var(--warn)}
+.spd small{font-size:var(--fs-micro);color:var(--txt-3);font-family:var(--font)}
+
+.star{font-size:15px;line-height:1;padding:4px;color:var(--txt-3);border-radius:6px;
+  transition:color .15s,transform .15s}
+.star:hover{color:var(--warn);transform:scale(1.08)}
+.star.on{color:var(--warn)}
+.c-star{display:flex;justify-content:flex-end}
+input[type=checkbox]{width:14px;height:14px;accent-color:var(--accent);cursor:pointer}
+
+/* 空态 / 骨架屏 */
+.empty{padding:36px 16px;text-align:center;color:var(--txt-3);font-size:var(--fs-body);line-height:1.7}
+.sk{background:linear-gradient(90deg,var(--line) 25%,var(--line-2) 37%,var(--line) 63%);
+  background-size:400% 100%;animation:sk 1.4s infinite;border-radius:5px;height:10px}
+@keyframes sk{0%{background-position:100% 0}100%{background-position:-100% 0}}
+.skrow{display:grid;grid-template-columns:26px 112px minmax(0,1fr) 170px 118px;
+  align-items:center;gap:8px;padding:0 12px;height:56px;border-bottom:1px solid var(--line)}
+.skrow .b{height:40px;border-radius:6px}
+.skrow .s{height:12px}
+
+/* ===== 底部操作条 ===== */
+footer{position:fixed;left:0;right:0;bottom:0;z-index:40;
+  background:color-mix(in srgb,var(--bg) 92%,transparent);backdrop-filter:blur(12px);
+  border-top:1px solid var(--line)}
+.fbar{max-width:1180px;margin:0 auto;padding:10px 20px;display:flex;align-items:center;
+  gap:10px;flex-wrap:wrap}
+.sel{font-size:var(--fs-meta);color:var(--txt-2);white-space:nowrap}
+.sel b{color:var(--txt);font-variant-numeric:tabular-nums}
+.sel .fav{color:var(--warn)}
+
+/* ===== 弹层 ===== */
+.mask{position:fixed;inset:0;background:rgba(8,10,14,.55);display:none;align-items:center;
+  justify-content:center;z-index:60;padding:20px}
 .mask.show{display:flex}
-.dlg{background:var(--card);border-radius:16px;box-shadow:0 24px 60px -20px rgba(0,0,0,.5);
-  width:min(760px,100%);max-height:88vh;display:flex;flex-direction:column;overflow:hidden}
-.dlg.sm{width:min(420px,100%)}
-.dhead{padding:16px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px}
-.dhead b{font-size:15px}
-.dbody{padding:16px 20px;overflow:auto}
-.dfoot{padding:12px 20px;border-top:1px solid var(--line);display:flex;justify-content:flex-end;gap:8px}
+.dlg{background:var(--card);border:1px solid var(--line);border-radius:var(--r-card);
+  box-shadow:var(--shadow-2);width:min(720px,100%);max-height:88vh;display:flex;flex-direction:column;
+  overflow:hidden}
+.dlg.sm{width:min(460px,100%)}
+.dhead{padding:14px 18px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px}
+.dhead b{font-size:var(--fs-h);font-weight:600}
+.dbody{padding:16px 18px;overflow:auto}
+.credit{max-width:1180px;margin:4px auto 18px;padding:0 20px;text-align:center;font-size:var(--fs-meta);color:var(--txt-3)}
+.credit a{color:var(--txt-2);text-decoration:none;border-bottom:1px dotted var(--line-2)}
+.dfoot{padding:12px 18px;border-top:1px solid var(--line);display:flex;justify-content:flex-end;gap:8px}
 .sec{margin-bottom:18px}
-.sec>h4{margin:0 0 10px;font-size:12.5px;color:var(--sub);font-weight:600;letter-spacing:.3px}
+.sec>h4{margin:0 0 10px;font-size:var(--fs-meta);color:var(--txt-3);font-weight:600;letter-spacing:.04em}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.f{display:flex;flex-direction:column;gap:5px;font-size:12.5px;color:var(--sub)}
-.f input[type=text],.f input[type=number]{height:34px;border:1px solid var(--line);border-radius:9px;
-  background:var(--bg);padding:0 10px;color:var(--txt);outline:none;width:100%}
-.f input:focus{border-color:var(--accent);background:var(--card)}
-.f label.ck{display:flex;align-items:center;gap:8px;height:34px;color:var(--txt);font-size:13px;cursor:pointer}
-.srcs{display:grid;grid-template-columns:1fr 1fr;gap:4px 12px}
-.src{display:flex;align-items:center;gap:8px;font-size:12.5px;padding:5px 6px;border-radius:8px}
-.src:hover{background:var(--bg)}
+.f{display:flex;flex-direction:column;gap:5px;font-size:var(--fs-meta);color:var(--txt-2)}
+.f input[type=text],.f input[type=number],.f select{height:32px;border:1px solid var(--line);
+  border-radius:var(--r-btn);background:var(--card-2);padding:0 10px;color:var(--txt);outline:none;width:100%}
+.f input:focus,.f select:focus{border-color:var(--accent);background:var(--card)}
+label.ck{display:flex;align-items:center;gap:8px;min-height:32px;color:var(--txt);
+  font-size:var(--fs-body);cursor:pointer}
+.srcs{display:grid;grid-template-columns:1fr 1fr;gap:2px 12px}
+.src{display:flex;align-items:center;gap:8px;font-size:var(--fs-meta);padding:5px 6px;border-radius:6px}
+.src:hover{background:var(--card-2)}
 .src .st{width:8px;height:8px;border-radius:50%;flex:0 0 auto}
 .src .n{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.src .m{color:var(--sub);font-size:11px;font-variant-numeric:tabular-nums;white-space:nowrap}
-.hint{font-size:12px;color:var(--sub);line-height:1.6}
-.err{color:var(--bad)}
-
-/* 首次运行的合规提示条：只声明"不含内容"，一句就能看懂 */
-.legal{display:flex;gap:14px;align-items:center;background:#fff7ed;border:1px solid #fed7aa;
-  border-radius:12px;padding:11px 14px;margin-bottom:12px}
-.legal .lt{font-weight:600;font-size:13px;color:#7c2d12;white-space:nowrap}
-.legal .ld{flex:1;font-size:12px;line-height:1.55;color:#9a3412}
-.legal .btn{flex:0 0 auto}
+.src .m{color:var(--txt-3);font-size:var(--fs-micro);font-variant-numeric:tabular-nums;white-space:nowrap}
+.src.off{opacity:.62}
 
 /* toast */
-#toast{position:fixed;left:50%;bottom:84px;transform:translateX(-50%) translateY(14px);z-index:70;
-  background:#1b1f24;color:#fff;font-size:13px;padding:10px 16px;border-radius:10px;opacity:0;
-  pointer-events:none;transition:.22s;max-width:88vw;box-shadow:0 12px 30px -10px rgba(0,0,0,.6)}
+#toast{position:fixed;left:50%;bottom:88px;transform:translateX(-50%) translateY(14px);z-index:70;
+  background:var(--card);border:1px solid var(--line-2);color:var(--txt);font-size:var(--fs-meta);
+  padding:10px 14px;border-radius:var(--r-btn);opacity:0;pointer-events:none;transition:.2s;
+  max-width:88vw;box-shadow:var(--shadow-2)}
 #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
-@media(max-width:820px){
-  .cards{grid-template-columns:1fr 1fr}
-  #fname{width:110px}
-}
 
-/* ---------- 平板 ---------- */
+/* ===== 响应式：<760 表格切两行卡片（台标必须还在）===== */
 @media(max-width:900px){
-  .hbar{flex-wrap:wrap;row-gap:6px}
-  .hbar .brand span{display:none}
-  .fbar{gap:6px}
-  .dlg{width:min(94vw,720px);max-height:92vh}
-  .grid2{grid-template-columns:1fr 1fr}
-  .thead,.tr{grid-template-columns:30px 96px minmax(0,1fr) 80px 160px 0;gap:6px;padding:0 6px}
-  .thead>div:nth-child(6),.tr>*:nth-child(6){display:none}
+  .stats{grid-template-columns:1fr 1fr}
+  .thead,.tr{grid-template-columns: 26px repeat(5, minmax(0,1fr)) 32px}
+  .thead>div:nth-child(4),.tr>.grp,.thead>div:nth-child(6),.tr>.epg{display:none}
 }
-
-/* ---------- 手机 ---------- */
-@media(max-width:600px){
-  .hbar{padding:6px 10px;gap:8px}
-  .logo{width:30px;height:30px}
-  .brand b{font-size:15px}
-  .pill{font-size:11px;padding:3px 8px}
-  #verPill{display:none}
-  .hbar .btn{padding:0 10px;height:30px;font-size:12.5px}
-  main{padding:10px 10px 96px}
-  .cards{grid-template-columns:1fr 1fr;gap:8px}
-  .stat{padding:6px 10px}
-  .stat b{font-size:17px}
-  .stat span{font-size:11px}
-  .toolbar{padding:8px 10px;gap:6px;flex-wrap:wrap}
-  .search{flex:1 1 100%;min-width:0}
-  .sortsel,.toolbar .btn{flex:0 0 auto}
-  .chips{overflow-x:auto;flex-wrap:nowrap;padding-bottom:2px;-webkit-overflow-scrolling:touch}
-  .chips::-webkit-scrollbar{display:none}
-  .chip{flex:0 0 auto}
-  /* 手机只留：勾选 + 台标 + 频道名 + 速率；分组/首选源隐藏 */
-  .thead,.tr{grid-template-columns:30px 60px minmax(0,1fr) 74px;gap:6px;padding:0 6px}
-  /* 手机上只留速率，"1080P"这类画质标签和数字挤在一起会换行 */
-  .tr .qa>span:first-child{display:none}
-  .thead>div:nth-child(4),.thead>div:nth-child(6),
-  .tr>*:nth-child(4),.tr>*:nth-child(6){display:none}
-  .tr .qa .spd{font-size:11.5px}
-  .tr{height:auto;min-height:46px;padding-top:6px;padding-bottom:6px}
-  .nm{white-space:normal;line-height:1.3}
-  .tbody{max-height:none;overflow:visible}
-  .fbar{padding:6px 10px 8px;gap:6px}
-  .fbar .cnt{flex:1 1 100%}
-  #outdir,#fname,#btnBrowse,#btnFolder{display:none}
-  .fbar .sel{flex:1 1 100%}
-  .fbar .btn{flex:1 1 100%;height:38px;font-size:14px}
-  .fbar .btn.primary{flex:1 1 100%;height:40px;font-size:15px}
+@media(max-width:760px){
+  .hbar{flex-wrap:wrap;row-gap:6px;padding:8px 12px}
+  .brand span{display:none}
+  main{padding:12px 12px 132px}
+  .thead{display:none}
+  .tbody{display:flex;flex-direction:column;gap:8px;padding:8px;max-height:none}
+  .tr{display:flex;flex-wrap:wrap;align-items:center;gap:8px 10px;height:auto;
+    padding:10px;border:1px solid var(--line);border-radius:var(--r-card);background:var(--card-2)}
+  .tr:hover{background:var(--card-2)}
+  .c-sel{order:1}
+  .lgcol{order:2}
+  .nm{order:3;flex:1 1 120px;min-width:0}
+  .c-star{order:4;margin-left:auto}
+  .tr>.grp{order:5;display:block}
+  .qa{order:6}
+  .tr>.epg{order:7;flex:1 1 140px;display:flex}
+  .spd{order:8;justify-content:flex-start;flex:0 0 auto}
+  .qa{flex-wrap:wrap}
+  /* 手机上"画质·码率"只留档位角标：一长串 1080P·9.1M·H.264 会把卡片挤成三行 */
+  .qa .meta{display:none}
+  .fbar{padding:8px 12px;gap:8px}
+  .sel{flex:1 1 100%}
+  .fbar .btn{flex:1 1 auto;height:36px}
+  .fbar .btn.primary{flex:1 1 100%;height:38px}
   .dlg{width:100vw;max-width:100vw;height:100vh;max-height:100vh;border-radius:0}
-  .mask{align-items:stretch;justify-content:stretch}
-  .dbody{max-height:none;flex:1 1 auto}
-  .dfoot{padding:10px 12px}
+  .mask{align-items:stretch;justify-content:stretch;padding:0}
   .grid2,.srcs{grid-template-columns:1fr}
-  .legal{flex-direction:column;align-items:stretch}
-  .legal .btn{align-self:flex-end}
-  .dfoot{position:sticky;bottom:0;background:var(--card);border-top:1px solid var(--line)}
-  .dlg{display:flex;flex-direction:column}
+  .dbody{flex:1 1 auto}
+  .legal{flex-direction:column;align-items:stretch;gap:8px}
 }
-
-/* ---------- 小屏手机 ---------- */
 @media(max-width:430px){
-  .brand b{font-size:14px}
-  .hbar .btn{height:28px;padding:0 8px;font-size:12px}
-  .stat b{font-size:16px}
-  .thead,.tr{grid-template-columns:30px 56px minmax(0,1fr) 70px}
+  .stat{padding:10px 12px}
+  .stat .v{font-size:20px}
+  .brand b{font-size:var(--fs-body)}
 }
-.legal[hidden]{display:none !important}
+@media (prefers-reduced-motion:reduce){*{animation:none !important;transition:none !important}}
 </style>
+<script>
+/* 主题尽早定下来，避免白屏闪一下：跟随系统，手动切过就记住（localStorage）。
+   ?theme=dark|light 只影响本次显示、不写入（截图/验收用）
+   2026-10-24：右下角「外观」面板存的是 ui-theme-mode / ui-accent，旧版顶栏按钮存的是 livetheme。
+   这里两个都读、新键优先——原来只读 livetheme，面板里选了"亮色"刷新后会被旧键拽回暗色，
+   页面正文（页尾那套）再改回来，等于闪一下、而且面板的选择形同没生效。 */
+(function(){
+  try{
+    var m=localStorage.getItem("ui-theme-mode")||localStorage.getItem("livetheme")||"auto";
+    if(m==="system") m="auto";
+    /* 只有旧键的人（早期顶栏按钮切过主题）在这里一次性搬到新键：
+       页尾"外观"面板那套只认 ui-theme-mode，不搬的话它会把旧键的选择当没有、按系统重来一遍。 */
+    if(!localStorage.getItem("ui-theme-mode")&&localStorage.getItem("livetheme"))
+      localStorage.setItem("ui-theme-mode",m);
+    var d=(m==="dark")||(m==="auto"&&window.matchMedia&&matchMedia("(prefers-color-scheme: dark)").matches);
+    var q=/[?&]theme=(dark|light)/.exec(location.search);
+    if(q) d=(q[1]==="dark");
+    document.documentElement.dataset.theme=d?"dark":"light";
+    var a=localStorage.getItem("ui-accent")||"default";
+    if(a!=="default") document.documentElement.dataset.accent=a;
+  }catch(e){document.documentElement.dataset.theme="dark"}
+})();
+</script>
 </head>
 <body>
 <header>
   <div class="hbar">
-    <img class="logo" src="__FAVICON__" alt="">
+    <img class="brandico" src="__FAVICON__" alt="">
     <div class="brand"><b>LIVE直播源</b><span>港澳台 + 央视卫视 + 地方台 · 自动测速挑源</span></div>
     <span class="pill" id="verPill">v-</span>
-    <span class="pill"><i class="ti" id="stDot"></i><span id="stTxt">启动中…</span></span>
+    <span class="pill" id="stPill"><i class="ti" id="stDot"></i><span id="stTxt">启动中…</span></span>
     <span class="spacer"></span>
     <button class="btn primary" id="btnUpdate">立即更新</button>
     <button class="btn" id="btnCfg">设置</button>
+    <button class="btn ghost" id="btnTheme" title="切换明暗">◐</button>
     <button class="btn danger" id="btnQuit">退出</button>
   </div>
   <div class="pwrap" id="progwrap"><div class="pbar" id="prog"></div></div>
@@ -3675,16 +4708,21 @@ footer{position:fixed;left:0;right:0;bottom:0;z-index:40;background:color-mix(in
     <div class="ld">它不提供、不托管、不转发任何直播流，也不解除任何付费或加密限制。能不能播放、内容是否合规，取决于你所在地区和那些公开来源本身；请自行确认当地法律法规与来源授权，仅供个人自用。</div>
     <button class="btn" id="btnLegal">我已了解</button>
   </div>
-  <div class="cards">
-    <div class="card stat"><b id="sChan">-</b><span id="sChanLb">实测可用频道</span></div>
-    <div class="card stat"><b id="sSrc">-</b><span>频道总数</span></div>
-    <div class="card stat"><b id="sHkmt">-</b><span>港澳台频道</span></div>
-    <div class="card stat"><b id="sTime">-</b><span>上次更新</span></div>
-  </div>
 
-  <div class="card toolbar">
+  <section class="stats">
+    <div class="stat"><div class="k">可用频道</div><div class="v" id="sChan">-</div>
+      <div class="d" id="sChanD">还没检测过</div></div>
+    <div class="stat"><div class="k">港澳台</div><div class="v" id="sHkmt">-</div>
+      <div class="d" id="sHkmtD">TVB / 凤凰 / 中天…</div></div>
+    <div class="stat"><div class="k">上次检测</div><div class="v" id="sTime">-</div>
+      <div class="d" id="sTimeD">下次自动更新 —</div></div>
+    <div class="stat"><div class="k">本次可用率</div><div class="v" id="sRate">-</div>
+      <div class="d" id="sRateD">清晰 — 条 · 收藏 —</div></div>
+  </section>
+
+  <section class="card toolbar">
     <div class="row">
-      <input class="search" id="q" placeholder="搜索频道名，例如 CCTV5 / 翡翠台 / 湖南卫视">
+      <input class="search" id="q" placeholder="搜索频道名，例如 CCTV5 / 翡翠台 / 湖南卫视　（ / 聚焦）">
       <select class="field sortsel" id="sort" title="排序方式">
         <option value="hot">常用优先（CCTV · 卫视 · 港澳台在前）</option>
         <option value="quality">画质优先（实测分辨率 × 码率）</option>
@@ -3697,44 +4735,78 @@ footer{position:fixed;left:0;right:0;bottom:0;z-index:40;background:color-mix(in
       <button class="btn" id="btnInv">反选</button>
     </div>
     <div class="row chips" id="chips"></div>
+    <!-- 【2026-10-25 用户「这些类别是不是太啰嗦」】这一排原来 12 个 chip、三种口径混着
+         （分辨率档 / 码率档 / 复合判定），互斥切换下点两个就丢前一个, 看着像十几个按钮。
+         按当前 86 个可用频道实测：仅可用=86(100%, 点了永远不变)、码率≥2.5M=79(92%)、
+         4K=0(点了必空)、720P=3、码率不足2M=6 与 分辨率偏低=15 又能并成一件事。
+         于是只留四种"意思不重叠"的：最严的一条(达标)、画质下限(仅看清晰)、网速下限、
+         以及反过来看问题源。分辨率/码率的阶梯不在这里做筛选 —— 上面"排序方式"下拉
+         本来就有 画质优先 / 码率优先 / 网络最快, 那才是排先后该用的工具。 -->
     <div class="row chips" id="chipsQ">
-      <button class="chip" data-f="pass" title="用户的标准：分辨率 ≥1080P、码率 ≥2 Mbps、下载吞吐 ≥400 KB/s，三条全满足">达标（1080P+ 清晰不卡）</button>
-      <button class="chip" data-f="ok" title="分辨率 ≥1080P 且 码率 ≥2 Mbps（只看画面清晰，不管网络速度）">仅看清晰</button>
-      <button class="chip" data-s="1" title="实测下载吞吐 ≥400 KB/s（≈3.2 Mbps）—— 达到这个速度看着不卡">网络 400KB/s+</button>
+      <button class="chip" data-f="pass" data-label="达标" title="用户的标准：分辨率 ≥1080P、码率 ≥2 Mbps、下载吞吐 ≥400 KB/s，三条全满足">达标</button>
+      <button class="chip" data-f="ok" data-label="仅看清晰" title="分辨率 ≥1080P 且 码率 ≥2 Mbps（只看画面清晰，不管网络速度）">仅看清晰</button>
+      <button class="chip" data-s="1" data-label="网络 400KB/s+" title="实测下载吞吐 ≥400 KB/s（≈3.2 Mbps）—— 达到这个速度看着不卡">网络 400KB/s+</button>
       <span class="qsep"></span>
-      <button class="chip" data-r="4" title="实测分辨率 4K（≥2000 像素）">4K</button>
-      <button class="chip" data-r="3" title="实测分辨率 1080P">1080P</button>
-      <button class="chip" data-r="2" title="实测分辨率 720P">720P</button>
-      <span class="qsep"></span>
-      <button class="chip" data-q="4" title="实测码率 ≥9 Mbps">码率≥9M</button>
-      <button class="chip" data-q="3" title="实测码率 ≥5 Mbps">码率≥5M</button>
-      <button class="chip" data-q="2" title="实测码率 ≥2.5 Mbps">码率≥2.5M</button>
-      <button class="chip" data-q="low" title="实测码率不到 2 Mbps（用户：这个码率画面就一般了）">码率不足2M</button>
-      <button class="chip" data-q="lowr" title="实测分辨率不到 720P，码率再高画面也细不了">分辨率偏低</button>
-      <span class="qsep"></span>
-      <button class="chip" data-qk="alive">仅可用</button>
+      <button class="chip" data-q="bad" data-label="有问题" title="码率不到 2 Mbps 或 分辨率低于 620 行 —— 单独看这一批, 好知道哪些源该换">有问题</button>
     </div>
-  </div>
+  </section>
 
-  <div class="card list">
-    <div class="thead"><div><input type="checkbox" id="ckAll"></div><div class="hlg">台标</div><div class="hch">频道</div><div>分组</div><div>画质（分辨率·码率）</div><div>首选源</div></div>
-    <div class="tbody" id="rows"><div class="empty">点右上角「立即更新」开始检测直播源。<br><span class="hint">每一轮都会重新实测，不会沿用上次的结果。</span></div></div>
-  </div>
-
-  <div class="foot"><span>LIVE直播源 · 作者 海风（kele551）</span>
-    <a href="https://github.com/kele551/LiveIPTV" target="_blank" rel="noopener">github.com/kele551/LiveIPTV</a></div>
+  <section class="card list">
+    <div class="thead">
+      <div><input type="checkbox" id="ckAll" title="全选当前筛选结果"></div>
+      <div class="hlg">台标</div>
+      <div>频道</div>
+      <div>分组</div>
+      <div>画质 · 码率</div>
+      <div>正在播出</div>
+      <div>速度</div>
+      <div></div>
+    </div>
+    <div class="tbody" id="rows">
+      <div class="empty">点右上角「立即更新」开始检测直播源。<br><span class="hint">每一轮都会重新实测，不会沿用上次的结果。</span></div>
+    </div>
+  </section>
+  <div class="credit">LIVE直播源 · 作者 海风（kele551）　·　<a href="https://github.com/kele551/LiveIPTV" target="_blank" rel="noopener">github.com/kele551/LiveIPTV</a>　·　所有请求只在本机；本页没有任何外部资源</div>
 </main>
 
 <footer>
   <div class="fbar">
-    <span class="sel">已选 <b id="selN">0</b> / <span id="selT">0</span> 个频道</span>
-    <input class="field" id="outdir" placeholder="保存目录">
-    <input class="field" id="fname" value="直播源.m3u">
-    <button class="btn" id="btnBrowse">选目录</button>
-    <button class="btn" id="btnFolder">打开目录</button>
+    <span class="sel">已选 <b id="selN">0</b> / <span id="selT">0</span> 个频道　收藏 <b class="fav" id="favN">0</b></span>
+    <span class="spacer"></span>
+    <button class="chip" id="btnFavOnly" title="只导出已收藏（★）的频道">只导收藏</button>
+    <button class="btn" id="btnExpSet">导出设置…</button>
     <button class="btn primary" id="btnSave">保存 M3U</button>
   </div>
 </footer>
+
+<!-- 导出设置 -->
+<div class="mask" id="expMask">
+  <div class="dlg sm">
+    <div class="dhead"><b>导出设置</b><span class="spacer"></span>
+      <button class="btn" id="btnExpX">关闭</button></div>
+    <div class="dbody">
+      <div class="f" style="margin-bottom:12px">保存目录
+        <div class="row">
+          <input type="text" id="outdir" placeholder="例如 F:\直播源" style="flex:1;min-width:0">
+          <button class="btn" id="btnBrowse">选目录</button>
+          <button class="btn" id="btnFolder">打开</button>
+        </div>
+      </div>
+      <div class="f" style="margin-bottom:12px">文件名
+        <input type="text" id="fname" value="直播源.m3u">
+      </div>
+      <div class="f" style="margin-bottom:12px">导出范围
+        <select id="expGrp"><option value="">全部（按勾选 / 只导收藏）</option></select>
+      </div>
+      <label class="ck" style="margin-bottom:6px"><input type="checkbox" id="expFav">只导收藏（★）的频道</label>
+      <div class="hint" id="expHint"></div>
+    </div>
+    <div class="dfoot">
+      <button class="btn" id="btnExpCancel">取消</button>
+      <button class="btn primary" id="btnExpGo">保存 M3U</button>
+    </div>
+  </div>
+</div>
 
 <!-- 设置 -->
 <div class="mask" id="cfgMask">
@@ -3747,32 +4819,34 @@ footer{position:fixed;left:0;right:0;bottom:0;z-index:40;background:color-mix(in
         <div class="grid2">
           <div class="f">自动更新间隔（小时）<input type="number" id="c_int" min="1" max="72"></div>
           <div class="f">每个频道备用源数量<input type="number" id="c_bak" min="1" max="8"></div>
-    <div class="f">最低码率 Mbps（低于此值不显示、不导出，0=不限）
-      <input type="number" id="c_min" min="0" max="50" step="0.5"></div>
-          <div class="f">EPG 节目单地址（可留空）<input type="text" id="c_epg" placeholder="http://…/epg.xml"></div>
+          <div class="f">最低码率 Mbps（低于此值不显示/不导出，0=不限）
+            <input type="number" id="c_min" min="0" max="50" step="0.5"></div>
+          <div class="f">EPG 节目单地址（可留空；填好就能显示"正在播出"）
+            <input type="text" id="c_epg" placeholder="http://…/epg.xml"></div>
           <div class="f">保存位置<input type="text" id="c_out" placeholder="M3U 输出路径"></div>
+          <div class="f">每个频道写入几条线路
+            <input type="number" id="c_urls" min="1" max="10" step="1" value="3"></div>
         </div>
         <div class="grid2" style="margin-top:10px">
-          <label class="f ck"><input type="checkbox" id="c_sd">保留标清频道</label>
-          <label class="f ck"><input type="checkbox" id="c_tv">只保留电视台频道（白名单，列表更干净）</label>
-          <label class="f ck"><input type="checkbox" id="c_junk">过滤非电视频道（DJ / 相声 / 助眠等）</label>
-        <label class="f ck"><input type="checkbox" id="c_lo">隐藏地级市/县级台（只留大台，列表更短）</label>
-        <label class="f"><span>每个频道写入几条线路</span><input class="in" id="c_urls" type="number" min="1" max="10" step="1" value="3"></label>
-        <label class="f ck"><input type="checkbox" id="c_lan">允许手机/平板在局域网访问（手机导入用）</label>
-        <div class="f hint" id="lanHint" style="grid-column:1/-1"></div>
-          <label class="f ck"><input type="checkbox" id="c_browser">启动时自动打开网页</label>
+          <label class="ck"><input type="checkbox" id="c_sd">保留标清频道</label>
+          <label class="ck"><input type="checkbox" id="c_tv">只保留电视台频道（白名单，列表更干净）</label>
+          <label class="ck"><input type="checkbox" id="c_junk">过滤非电视频道（DJ / 相声 / 助眠等）</label>
+          <label class="ck"><input type="checkbox" id="c_lo">隐藏地级市/县级台（只留大台，列表更短）</label>
+          <label class="ck"><input type="checkbox" id="c_lan">允许手机/平板在局域网访问（手机导入用）</label>
+          <label class="ck"><input type="checkbox" id="c_browser">启动时自动打开网页</label>
+          <div class="f hint" id="lanHint" style="grid-column:1/-1"></div>
         </div>
       </div>
 
       <div class="sec">
         <h4>程序</h4>
         <div class="grid2">
-          <label class="f ck"><input type="checkbox" id="c_tray">显示右下角托盘图标</label>
-          <label class="f ck"><input type="checkbox" id="c_auto">开机自动启动</label>
-          <label class="f ck"><input type="checkbox" id="c_task">按间隔用计划任务后台更新</label>
-          <label class="f ck"><input type="checkbox" id="c_su">检查程序新版本</label>
-          <label class="f ck"><input type="checkbox" id="c_sig">升级包必须验签（推荐）</label>
-          <label class="f ck"><input type="checkbox" id="c_suauto">发现新版本自动下载</label>
+          <label class="ck"><input type="checkbox" id="c_tray">显示右下角托盘图标</label>
+          <label class="ck"><input type="checkbox" id="c_auto">开机自动启动</label>
+          <label class="ck"><input type="checkbox" id="c_task">按间隔用计划任务后台更新</label>
+          <label class="ck"><input type="checkbox" id="c_su">检查程序新版本</label>
+          <label class="ck"><input type="checkbox" id="c_sig">升级包必须验签（推荐）</label>
+          <label class="ck"><input type="checkbox" id="c_suauto">发现新版本自动下载</label>
         </div>
         <div class="grid2" style="margin-top:10px">
           <div class="f">升级源地址（version.json）<input type="text" id="c_url" placeholder="https://…/version.json"></div>
@@ -3812,8 +4886,11 @@ footer{position:fixed;left:0;right:0;bottom:0;z-index:40;background:color-mix(in
 <div id="toast"></div>
 <script>
 "use strict";
-var CH=[], sel=new Set(), grp="", rf="", qf="", qk="", sf="", q="", sk="hot", lastLoaded="", timer=null, dirty=false;
-var fresh=false, wasUpdating=false;   // fresh=本次打开后跑完过一轮更新，才把频道列出来
+var CH=[], EPG={}, sel=new Set(), favSet=new Set();
+var grp="", rf="", qf="", qk="", sf="", kw="", sk="hot", fa=false, favOnly=false;
+var VERSION="-", DESKTOP="", selLoaded=false, dirty=false, fresh=false, wasUpdating=false;
+var loadedOnce=false, epgTimer=null;
+var URLTHEME=/[?&]theme=(dark|light)/.exec(location.search);   // ?theme= 只影响本次显示（截图/验收用）
 var GORDER=["央视","卫视","香港","澳门","台湾","体育","电影","少儿","游戏","国际·综合","地方台","其他"];
 var $=function(id){return document.getElementById(id)};
 
@@ -3821,32 +4898,42 @@ function toast(msg,ms){
   var t=$("toast"); t.textContent=msg; t.classList.add("show");
   clearTimeout(t._t); t._t=setTimeout(function(){t.classList.remove("show")}, ms||2600);
 }
-function saveSel(){
-  try{localStorage.setItem("livesel", JSON.stringify([].concat(Array.from(sel))));}catch(e){}
+function esc(s){
+  return String(s==null?"":s).replace(/[&<>"']/g,function(m){
+    return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m];
+  });
 }
-function loadSel(){
-  try{ var a=JSON.parse(localStorage.getItem("livesel")||"null"); if(a&&a.length){sel=new Set(a);return true;} }catch(e){}
-  return false;
-}
-// 主题跟随系统
-function applyTheme(){
-  var d=window.matchMedia&&matchMedia("(prefers-color-scheme: dark)").matches;
-  document.documentElement.dataset.theme=d?"dark":"light";
-}
-if(window.matchMedia) window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change",applyTheme);
-applyTheme();
 
-// 画质判据（与后端 _src_quality / quality_label 同一套口径，按用户 2026-10-20 给的门槛）：
-//   清晰 = 实测分辨率 ≥1080P 且 实测码率 ≥2 Mbps；
-//   流畅 = 实测下载吞吐 ≥400 KB/s（≈3.2 Mbps，不够就会转圈/卡顿）。
-// 界面上两个指标都亮出来，别只给一个数字让用户猜。
+/* ---------------- 主题 ---------------- */
+function sysDark(){ return !!(window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches) }
+function themeMode(){
+  /* 新键（外观面板）优先，旧键 livetheme 兼容；两个键写的是同一套值，见 toggleTheme */
+  try{ return localStorage.getItem("ui-theme-mode")||localStorage.getItem("livetheme")||"auto" }catch(e){ return "auto" }
+}
+function applyTheme(mode){
+  var th = (mode==="dark"||mode==="light") ? mode : (sysDark() ? "dark" : "light");
+  if(URLTHEME) th = URLTHEME[1];
+  document.documentElement.dataset.theme = th;
+  var b=$("btnTheme");
+  if(b) b.title = "切换明暗（当前：" + (mode==="auto"?"跟随系统 · ":"") + (th==="dark"?"暗色":"亮色") + "）";
+}
+function toggleTheme(){
+  var next = (document.documentElement.dataset.theme==="dark") ? "light" : "dark";
+  try{ localStorage.setItem("livetheme", next); localStorage.setItem("ui-theme-mode", next) }catch(e){}
+  applyTheme(next);
+}
+applyTheme(URLTHEME ? URLTHEME[1] : themeMode());
+if(window.matchMedia) window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change",function(){
+  if(themeMode()==="auto") applyTheme("auto");
+});
+
+/* ---------------- 画质判据（与后端 quality_label / _src_quality 同一套口径）---------------- */
 var REST=[[2000,4,"4K"],[1000,3,"1080P"],[620,2,"720P"],[400,1,"480P"]];
 var CLARITY_H=1000, CLARITY_MB=2.0, SMOOTH_KB=400;
 function resLv(r){ r=r||0; if(r<=0) return 0; for(var i=0;i<REST.length;i++){ if(r>=REST[i][0]) return REST[i][1] } return 0.3 }
 function mbLv(m){ m=m||0; if(m<=0) return 0; if(m>=9) return 4; if(m>=5) return 3; if(m>=2.5) return 2; if(m>=1) return 1; return 0.3 }
 function resName(r){ var l=resLv(r); if(!l) return ""; if(l<1) return "低分辨率";
   for(var i=0;i<REST.length;i++){ if(l===REST[i][1]) return REST[i][2] } return "" }
-// 吞吐：后端 speed 单位是 Mbps，换算成 KB/s 更接近用户看的播放器数字
 function kbps(c){ var b=c.best||{}; return (b.speed||0)*125 }
 function mbpsTxt(m){ return (m||0).toFixed(1)+"M" }
 function qScore(c){
@@ -3854,16 +4941,14 @@ function qScore(c){
   if(!(m>0)) return rs?(rs*10*0.35):2.0;
   var adequate=Math.min(1, m/CLARITY_MB);
   var bonus=Math.min(1, m/10)*5;
-  var base=rs||2.0;                      // 没测到分辨率按 720P 记，不虚高也不打死
+  var base=rs||2.0;
   return base*10*(0.55+0.45*adequate)+bonus;
 }
 function clearEnough(c){ var b=c.best||{}; return (b.res||0)>=CLARITY_H && (b.mbps||0)>=CLARITY_MB }
 function smoothEnough(c){ return kbps(c)>=SMOOTH_KB }
 function lowBit(c){ var m=(c.best||{}).mbps||0; return m>0 && m<CLARITY_MB }
 function lowRes(c){ var r=(c.best||{}).res||0; return r>0 && r<620 }
-// 画质列：分辨率档 + 实测码率，两个数字并排，缺哪个标哪个
 function detailText(c){
-  // 鼠标悬停看这一路的全部实测细节：分辨率(像素)、编码、码率、我这边的下载速度、首包延迟
   var b=c.best||{}, p=[];
   if(b.res_wh&&b.res_wh[0]) p.push("实测分辨率 "+b.res_wh[0]+"×"+b.res_wh[1]);
   else if(b.res) p.push("分辨率 "+(c.res_est?"≈":"")+b.res+"p"+(c.res_est?"(借同频道其它源)":""));
@@ -3874,80 +4959,88 @@ function detailText(c){
   p.push("可用线路 "+(c.live_count||(c.sources||[]).length)+" 条");
   return p.join(" · ");
 }
-function spd(c){
-  var b=c.best||{}, rn=resName(b.res||0), m=b.mbps||0;
-  if(rn && c.res_est) rn="≈"+rn;      // 这个源的码流读不出分辨率，借同频道其它源的实测值
-  var parts=[];
-  if(rn) parts.push(rn); else if(b.live) parts.push("分辨率未测");
-  if(m>0) parts.push("码率"+mbpsTxt(m)); else if(b.live) parts.push("码率未测");
-  if(!parts.length) return c.quality||"";
-  return parts.join(" · ");
+function qText(c){
+  var b=c.best||{}, rn=resName(b.res||0), m=b.mbps||0, p=[];
+  if(rn) p.push((c.res_est?"≈":"")+rn);
+  if(m>0) p.push(mbpsTxt(m));
+  if(b.codec) p.push(b.codec);
+  if(!p.length) return c.quality||"未测";
+  return p.join(" · ");
 }
 function tagCls(c){
   var b=c.best||{};
   if(!b.live) return "tag";
   if(clearEnough(c)) return ((b.res||0)>=1800?"tag q4":"tag q3");
-  if(lowBit(c)) return "tag q1";                       // 分辨率够、码率不够(湖南卫视那种)
-  if(lowRes(c)) return "tag q1";                       // 码率够、分辨率不够
+  if(lowBit(c)) return "tag q1";
+  if(lowRes(c)) return "tag q1";
   if((b.res||0)>=620) return "tag q2";
   return "tag";
 }
+function tagText(c){
+  if(c.qlabel) return c.qlabel;
+  var rn=resName((c.best||{}).res||0);
+  return rn||"未测";
+}
 function host(u){ try{ return new URL(u).host; }catch(e){ return u||"" } }
 function isHkmt(c){ return ["香港","澳门","台湾"].indexOf(c.group)>=0 }
-
 function gidx(g){ var i=GORDER.indexOf(g); return i<0?90:i }
-// CCTV 频道按编号排(CCTV1..CCTV17 整齐)，其余归到 99
 function cnum(n){ var m=(n||"").match(/cctv[-\s]*(\d{1,2})/i); return m?+m[1]:99 }
-// 同号里把"标准台"排前面(CCTV4 在 CCTV4K / CCTV-4 Europe 之前)
 function cbase(n){ return /^cctv[-\s]?\d{1,2}$/i.test((n||"").trim())?0:1 }
 function mb(c){ var b=c.best||{}; return b.speed||b.mbps||0 }
 function mbbr(c){ var b=c.best||{}; return b.mbps||0 }
+
+function isFav(c){ return favSet.has(c.key) || !!c.fav }
+function favCount(){ return CH.filter(isFav).length }
+
 function filtered(){
-  var kw=q.trim().toLowerCase();
+  var k=kw.trim().toLowerCase();
   var list=CH.filter(function(c){
     if(grp && c.group!==grp) return false;
+    if(fa && !isFav(c)) return false;
     var b=c.best||{};
-    if(rf && String(resLv(b.res||0))!==rf) return false;           // 按实测分辨率筛
-    if(sf && !smoothEnough(c)) return false;                       // 网络 ≥400KB/s
-    if(qf==="pass" && !(clearEnough(c) && smoothEnough(c))) return false;   // 用户标准：清晰+不卡
-    if(qf==="ok" && !clearEnough(c)) return false;                 // 清晰：分辨率+码率都达标
-    if(qf==="low" && !lowBit(c)) return false;                     // 码率不足 2M
-    if(qf==="lowr" && !lowRes(c)) return false;                    // 分辨率偏低
+    if(rf && String(resLv(b.res||0))!==rf) return false;
+    if(sf && !smoothEnough(c)) return false;
+    if(qf==="pass" && !(clearEnough(c) && smoothEnough(c))) return false;
+    if(qf==="ok" && !clearEnough(c)) return false;
+    if(qf==="low" && !lowBit(c)) return false;
+    if(qf==="lowr" && !lowRes(c)) return false;
+    /* 「有问题」= 码率不足 或 分辨率偏低, 两个角标合并成一条筛选 */
+    if(qf==="bad" && !(lowBit(c) || lowRes(c))) return false;
     if(qf && "01234".indexOf(qf)>=0){
       var m=b.mbps||0;
       if(!(m>0)) return false;
-      if(String(mbLv(m))!==qf) return false;                       // 按实测码率档筛
+      if(String(mbLv(m))!==qf) return false;
     }
     if(qk==="hkmt" && !isHkmt(c)) return false;
     if(qk==="alive" && !(c.best&&c.best.live)) return false;
-    if(kw && ((c.name||"")+" "+(c.aka||"")).toLowerCase().indexOf(kw)<0) return false;
+    if(k && ((c.name||"")+" "+(c.aka||"")).toLowerCase().indexOf(k)<0) return false;
     return true;
   });
   list.sort(function(a,b){
-    if(sk==="quality"){                    // 画质优先：分辨率+码率短板算出来的综合分
+    if(sk==="quality"){
       var d=qScore(b)-qScore(a);
       if(d) return d;
       var g4=gidx(a.group)-gidx(b.group);
       if(g4) return g4;
     }
     if(sk==="hot"||sk==="group"){
-      var g=gidx(a.group)-gidx(b.group);   // 常看的组在前(CCTV/卫视/港澳台)
+      var g=gidx(a.group)-gidx(b.group);
       if(g) return g;
-      var ca=cnum(a.name), cb=cnum(b.name);   // CCTV1..CCTV17 按编号排整齐
+      var ca=cnum(a.name), cb=cnum(b.name);
       if(ca!==cb) return ca-cb;
       var ba=cbase(a.name), bb=cbase(b.name);
       if(ba!==bb) return ba-bb;
       if(sk==="hot"){ var d0=qScore(b)-qScore(a); if(d0) return d0 }
     }
-    if(sk==="bitrate"){                    // 纯按实测码率排(带宽有限时用)
+    if(sk==="bitrate"){
       var d1=(mbbr(b)-mbbr(a));
       if(d1) return d1;
       var g5=gidx(a.group)-gidx(b.group);
       if(g5) return g5;
     }
     if(sk==="speed"){
-      var d=mb(b)-mb(a);
-      if(d) return d;                      // 实测快的排前面
+      var ds=mb(b)-mb(a);
+      if(ds) return ds;
       var g2=gidx(a.group)-gidx(b.group);
       if(g2) return g2;
     }
@@ -3956,6 +5049,156 @@ function filtered(){
   return list;
 }
 
+/* ---------------- 台标（硬约束：图片 / 字母牌兜底都必须保留）---------------- */
+function logoTile(name){
+  // 没有台标图片时补一个"字母牌"：按名字取稳定颜色 + 头 2~3 个字，整列看起来是齐的
+  var n = (name||"?").replace(/\s+/g,"");
+  var parts = (name||"").split(/[\s\-—·]+/).filter(function(x){return x});
+  var tail = parts.length ? parts[parts.length-1] : n;
+  var isCJK = /[\u4e00-\u9fa5]/.test(tail);
+  var ch = isCJK ? tail.slice(0,3) : tail.slice(0,3).toUpperCase();
+  var h = 0;
+  for (var i=0;i<n.length;i++) h = (h*31 + n.charCodeAt(i)) % 360;
+  return '<span class="ph" style="background:hsl('+h+',58%,46%)">'+esc(ch)+'</span>';
+}
+function logoCell(c){
+  if(c.logo){
+    return '<span class="lg'+(c.logo_kind==="white"?" dk":"")+'" data-nm="'+esc(c.name)+'">'
+      +'<img class="logo" loading="lazy" src="'+esc(c.logo)+'" alt="'+esc(c.name)+' 台标"'
+      +' onerror="logoFail(this)"></span>';
+  }
+  return logoTile(c.name);
+}
+// 图挂了（上游 404、防盗链、断网）：这一格别空着 —— 空一个 104x40 的洞，
+// 跟旁边有图的行、跟"没台标"走字母牌的行是三种样子。退成字母牌，整列只有两种状态。
+function logoFail(img){
+  var host = img.parentNode;
+  if(!host || !host.classList || !host.classList.contains("lg")) return;
+  var nm = (host.getAttribute && host.getAttribute("data-nm")) || "";
+  host.outerHTML = logoTile(nm);
+}
+
+/* ---------------- 台标尺寸归一（2026-10-24 用户：「区别太大了，统一样式和尺寸」）----------------
+   根因是量出来的，不是猜的：上游图库这批台标的画布几乎全是 300x180，可"看得见的内容"
+   占整幅高度的比例从 22%（余杭新闻那种一条扁字）到 100%（山西卫视顶满画布）都有，
+   央视那套是 69%。以前一律 object-fit:contain 塞进 104x40，等于照搬这个比例 ——
+   同一列里最高 40px、最矮 8.8px，差 4.5 倍，所以一眼就是"大小不一"。
+   现在图片解出来先量一次内容框（透明底看 alpha；整幅不透明的看"和四角底色差多少"，
+   白底实心的标也能裁掉边），再等比缩放平移到画框中央一个 92x26 的目标框里：
+   高的按高、宽的按宽，谁也不溢出，一排看过去就是同一个光学大小。
+   量不动的（跨域图、解码失败）保持原来的 contain，宁可不动也不要动错。 */
+var LOGO_FIT_W = 92, LOGO_FIT_H = 26;   // 内容目标框：104x40 画框里留出呼吸边
+var _logoBox = {};                      // src -> [x, y, w, h, 原宽, 原高]，同一条 URL 只量一次
+var _lcv = null, _lcx = null;
+
+function _logoCtx(w, h){
+  if(!_lcv){
+    _lcv = document.createElement("canvas");
+    _lcx = _lcv.getContext("2d", {willReadFrequently:true});
+  }
+  _lcv.width = w; _lcv.height = h;
+  return _lcx;
+}
+
+function logoContentBox(img){
+  var key = img.getAttribute("src") || img.src || "";
+  if(!key) return null;
+  if(_logoBox[key]) return _logoBox[key];
+  var nw = img.naturalWidth, nh = img.naturalHeight;
+  if(!nw || !nh) return null;
+  var s = Math.min(1, 128 / Math.max(nw, nh));      // 缩到最长边 128px 再扫，定个框够用且不卡
+  var w = Math.max(1, Math.round(nw * s)), h = Math.max(1, Math.round(nh * s));
+  var d;
+  try{
+    var cx = _logoCtx(w, h);
+    cx.clearRect(0, 0, w, h);
+    cx.drawImage(img, 0, 0, w, h);
+    d = cx.getImageData(0, 0, w, h).data;           // 台标走本机 /logo 中转，同源，读得动
+  }catch(e){ return null; }                         // 万一哪天又直连外链：放弃归一，维持原样
+  var n = w * h, opaque = 0, i;
+  for(i = 0; i < n; i++){ if(d[i * 4 + 3] >= 250) opaque++; }
+  var solid = opaque > n * 0.98;                    // 整幅不透明 = 背景是实色，不是透明底
+  var br = 0, bg = 0, bb = 0;
+  if(solid){
+    var cor = [0, (w - 1) * 4, (h - 1) * w * 4, ((h - 1) * w + w - 1) * 4];
+    for(i = 0; i < 4; i++){ br += d[cor[i]]; bg += d[cor[i] + 1]; bb += d[cor[i] + 2]; }
+    br /= 4; bg /= 4; bb /= 4;
+  }
+  var x0 = w, y0 = h, x1 = -1, y1 = -1;
+  for(var y = 0; y < h; y++){
+    for(var x = 0; x < w; x++){
+      var o = (y * w + x) * 4;
+      if(d[o + 3] < 28) continue;                   // 近乎全透明：不算内容
+      if(solid){
+        var dr = d[o] - br, dg2 = d[o + 1] - bg, db = d[o + 2] - bb;
+        if(dr * dr + dg2 * dg2 + db * db < 3600) continue;   // 跟四角底色差得不够 = 还是背景
+      }
+      if(x < x0) x0 = x; if(x > x1) x1 = x;
+      if(y < y0) y0 = y; if(y > y1) y1 = y;
+    }
+  }
+  if(x1 < 0) return null;                           // 整幅透明/整幅一个色：没有可信的内容框
+  var r = [x0 / s, y0 / s, (x1 - x0 + 1) / s, (y1 - y0 + 1) / s, nw, nh];
+  _logoBox[key] = r;
+  return r;
+}
+
+function logoFit(img){
+  var host = img.parentNode;
+  if(!host || !host.classList || !host.classList.contains("lg")) return;
+  if(host.classList.contains("fit")) return;        // 已经摆好了（重渲染时同一张图会再走一遍）
+  var b = logoContentBox(img);
+  if(!b) return;
+  var bx = b[0], by = b[1], bw = Math.max(1, b[2]), bh = Math.max(1, b[3]), nw = b[4], nh = b[5];
+  var FW = host.clientWidth || 104, FH = host.clientHeight || 40;
+  var k = Math.min(LOGO_FIT_W / bw, LOGO_FIT_H / bh);
+  if(!isFinite(k) || k <= 0) return;
+  img.style.width  = (nw * k).toFixed(2) + "px";
+  img.style.height = (nh * k).toFixed(2) + "px";
+  img.style.left   = (FW / 2 - (bx + bw / 2) * k).toFixed(2) + "px";
+  img.style.top    = (FH / 2 - (by + bh / 2) * k).toFixed(2) + "px";
+  host.classList.add("fit");
+}
+
+// 图片是异步解出来的：load 事件不冒泡，用捕获阶段挂一个全局监听，行分块追加也照样接得住
+document.addEventListener("load", function(e){
+  var t = e.target;
+  if(t && t.tagName === "IMG" && t.classList.contains("logo")) logoFit(t);
+}, true);
+
+function fitLogos(root){
+  var a = (root || document).getElementsByTagName("img");
+  for(var i = 0; i < a.length; i++){
+    if(a[i].classList.contains("logo") && a[i].complete && a[i].naturalWidth) logoFit(a[i]);
+  }
+}
+
+/* ---------------- 正在播出（EPG）---------------- */
+function epgHtml(c){
+  var e=EPG[c.key];
+  if(!e) return '<div class="epg" title="没有 EPG 数据（设置里填 EPG 地址即可显示）"><span class="tm">—</span></div>';
+  var w=Math.max(0,Math.min(100,e.p||0));
+  return '<div class="epg" title="正在播出：'+esc(e.t)+'（'+esc(e.s)+'–'+esc(e.e)+'）">'
+    +'<b>'+esc(e.t)+'</b><span class="tm">'+esc(e.s)+'–'+esc(e.e)+'</span>'
+    +'<span class="bar"><i data-s0="'+(e.s0||0)+'" data-e0="'+(e.e0||0)+'" style="width:'+w+'%"></i></span></div>';
+}
+function tickEpg(){
+  var now=Date.now()/1000;
+  [].forEach.call(document.querySelectorAll(".epg .bar i"),function(el){
+    var s0=+el.dataset.s0, e0=+el.dataset.e0;
+    if(!s0||!e0||e0<=s0) return;
+    var p=Math.max(0,Math.min(100,(now-s0)*100/(e0-s0)));
+    el.style.width=p.toFixed(1)+"%";
+  });
+}
+function loadEpg(){
+  fetch("/api/epg").then(function(r){return r.json()}).then(function(d){
+    EPG = d.now || {};
+    renderRows();
+  }).catch(function(){});
+}
+
+/* ---------------- 渲染 ---------------- */
 function renderChips(){
   var gs=[], seen={};
   CH.forEach(function(c){ if(!seen[c.group]){seen[c.group]=1;gs.push(c.group)} });
@@ -3964,145 +5207,209 @@ function renderChips(){
     var ia=order.indexOf(a), ib=order.indexOf(b);
     return (ia<0?99:ia)-(ib<0?99:ib);
   });
-  var html='<button class="chip'+(grp?"":" on")+'" data-g="">全部</button>';
+  var html='<button class="chip'+((grp||fa)?"":" on")+'" data-g="">全部 '+CH.length+'</button>'
+    +'<button class="chip fav'+(fa?" on":"")+'" data-fav="1">★ 收藏 '+favCount()+'</button>';
   gs.forEach(function(g){
     var n=CH.filter(function(c){return c.group===g}).length;
     html+='<button class="chip'+(grp===g?" on":"")+'" data-g="'+esc(g)+'">'+esc(g)+' '+n+'</button>';
   });
   $("chips").innerHTML=html;
 }
-function logoTile(name){
-  // 没有台标图片时补一个"字母牌"：按名字取稳定颜色 + 头 2~3 个字，整列看起来是齐的
-  var n = (name||"?").replace(/\s+/g,"");
-  // 取最有辨识度的一段：CCTV2 财经 → 财经；CCTV-4 Europe → Eur
-  var parts = (name||"").split(/[\s\-—·]+/).filter(function(x){return x});
-  var tail = parts.length ? parts[parts.length-1] : n;
-  var isCJK = /[\u4e00-\u9fa5]/.test(tail);
-  var ch = isCJK ? tail.slice(0,3) : tail.slice(0,3).toUpperCase();
-  var h = 0;
-  for (var i=0;i<n.length;i++) h = (h*31 + n.charCodeAt(i)) % 360;
-  return '<span class="ph" style="background:hsl('+h+',58%,46%);color:#fff;font-size:10px;'+
-         'display:flex;align-items:center;justify-content:center;overflow:hidden;padding:0 2px">'+
-         esc(ch)+'</span>';
-}
-function esc(s){
-  return String(s==null?"":s).replace(/[&<>"']/g,function(m){
-    return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m];
-  });
+/* 第二排 chip 也标上"点下去还剩几条"（和第一排分组 chip 同一个口径）。
+   2026-10-25：这一排从 12 个砍到 4 个之后，剩下的每个都得看得出值不值一点 ——
+   光写"达标"不知道有多少，写完"达标 16"用户一眼就知道现在网络/画质什么状况。 */
+function qCount(b){
+  var d=b.dataset;
+  if(d.f==="pass") return CH.filter(function(c){ return clearEnough(c) && smoothEnough(c) }).length;
+  if(d.f==="ok") return CH.filter(function(c){ return clearEnough(c) }).length;
+  if(d.s!==undefined) return CH.filter(function(c){ return smoothEnough(c) }).length;
+  if(d.q==="bad") return CH.filter(function(c){ return lowBit(c) || lowRes(c) }).length;
+  return -1;
 }
 function renderQ(){
   [].forEach.call($("chipsQ").querySelectorAll(".chip"),function(b){
     var on;
     if(b.dataset.r!==undefined) on = (rf===b.dataset.r);
     else if(b.dataset.q!==undefined) on = (qf===b.dataset.q);
+    else if(b.dataset.f!==undefined) on = (qf===b.dataset.f);
+    else if(b.dataset.s!==undefined) on = !!sf;
     else on = (qk===b.dataset.qk);
     b.classList.toggle("on", !!on);
+    if(b.dataset.label){
+      var n=qCount(b);
+      b.textContent = n>=0 ? (b.dataset.label + ' ' + n) : b.dataset.label;
+    }
   });
+  var f=$("btnFavOnly"); if(f) f.classList.toggle("on", favOnly);
 }
-
+function skeleton(){
+  var h='';
+  for(var i=0;i<6;i++){
+    h+='<div class="skrow"><span class="sk" style="height:14px;width:14px"></span>'
+      +'<span class="sk b"></span><span class="sk s" style="width:'+(45+((i*13)%40))+'%"></span>'
+      +'<span class="sk s"></span><span class="sk s"></span></div>';
+  }
+  $("rows").innerHTML=h;
+}
 function renderRows(){
+  var token=++renderToken;
   var list=filtered(), rows=$("rows");
   if(!CH.length){
+    if(!loadedOnce){ skeleton(); updCount(); return; }
     rows.innerHTML='<div class="empty">还没有频道。<br>点右上角「立即更新」，跑完（约 1~2 分钟）就会把实测可用的频道列在这里。</div>';
     updCount(); return;
   }
-  if(!list.length){ rows.innerHTML='<div class="empty">没有符合条件的频道。清空搜索或切回「全部」看看。</div>'; updCount(); return; }
-  var html="";
-  list.forEach(function(c){
-    var alive=c.best&&c.best.live;
-    var n=(c.sources||[]).length;
-    html+='<div class="tr'+(alive?"":" dead")+'" data-k="'+esc(c.key)+'">'
-      +'<div><input type="checkbox" data-ck="'+esc(c.key)+'"'+(sel.has(c.key)?" checked":"")+'></div>'
-      +'<div class="lgcol">'+(c.logo?('<span class="lg'+(c.logo_kind==="white"?" dk":"")+'"><img loading="lazy" src="'+esc(c.logo)+'" onerror="this.style.visibility=\'hidden\'"></span>'):logoTile(c.name))+'</div>'
-      +'<div class="nm"><span class="t">'+esc(c.name)+'</span>'+(n>1?'<span class="nsrc">'+n+' 源</span>':'')+'</div>'
-      +'<div class="grp">'+esc(c.group)+'</div>'
-      +'<div class="qa" title="'+esc(alive?detailText(c):"这一路没连上")+'"><span class="'+tagCls(c)+'">'+esc((c.qlabel||spd(c))||"未知")+'</span>'
-      +'<span class="spd">'+esc(alive?(spd(c)||"已实测"):"不可用")+'</span>'
-      +(alive&&c.best&&c.best.codec?'<span class="cd" title="实测编码">'+esc(c.best.codec)+'</span>':'')+'</div>'
-      +'<div class="host"><span class="h">'+esc(alive?host(c.best.url).split(":")[0]:"—")+'</span>'
-      +((alive&&kbps(c)>0)?('<span class="net'+(smoothEnough(c)?" ok":" slow")+'" title="实测下载吞吐：'+
-          (smoothEnough(c)?"达到 400 KB/s，看着不卡":"不到 400 KB/s，可能转圈/卡顿")+'">'+
-          Math.round(kbps(c))+' KB/s</span>'):'')
+  if(!list.length){
+    rows.innerHTML='<div class="empty">没有符合条件的频道。清空搜索、切回「全部」，或关掉「只导收藏」看看。</div>';
+    updCount(); return;
+  }
+  // 先画第一屏（48 行），剩下的按帧追加：一次把几百行全铺进 DOM 会让首屏卡一下
+  var CHUNK=48, parts=[];
+  for(var i=0;i<list.length;i+=CHUNK){
+    var buf="";
+    for(var j=i;j<Math.min(i+CHUNK,list.length);j++) buf+=rowHtml(list[j]);
+    parts.push(buf);
+  }
+  rows.innerHTML=parts[0]||"";
+  fitLogos(rows);                    // 命中浏览器缓存的图不会再发 load 事件，这里补扫一遍
+  updCount();                      // 计数先更新，不等列表画完
+  var k=1;
+  (function step(){
+    if(token!==renderToken) return;      // 期间又渲染过一次：丢掉这次的剩余部分
+    if(k>=parts.length){ return; }
+    rows.insertAdjacentHTML("beforeend", parts[k++]);
+    fitLogos(rows);
+    setTimeout(step,0);
+  })();
+}
+
+function rowHtml(c){
+  var alive=c.best&&c.best.live;
+  var n=c.live_count||(c.sources||[]).length;
+  var sp=Math.round(kbps(c));
+  var hst=alive?host(c.best.url).split(":")[0]:"—";
+  return '<div class="tr'+(alive?"":" dead")+'" data-k="'+esc(c.key)+'">'
+    +'<div class="c-sel"><input type="checkbox" data-ck="'+esc(c.key)+'"'+(sel.has(c.key)?" checked":"")+' title="勾选后导出"></div>'
+    +'<div class="lgcol">'+logoCell(c)+'</div>'
+    +'<div class="nm"><span class="t" title="'+esc(c.name)+'">'+esc(c.name)+'</span>'
+      +'<span class="sub">'+(n>1?'<span class="nsrc">'+n+' 源</span>':'')+'<span>'+esc(hst)+'</span></span></div>'
+    +'<div class="grp">'+esc(c.group||"其他")+'</div>'
+    +'<div class="qa" title="'+esc(alive?detailText(c):"这一路没连上")+'">'
+      +'<span class="'+tagCls(c)+'">'+esc(alive?tagText(c):"不可用")+'</span>'
+      +'<span class="meta">'+esc(alive?qText(c):"—")+'</span>'
       +((alive&&lowBit(c))?'<span class="lowb" title="码率不到 2 Mbps：用户实测这个码率画面就一般了">码率不足</span>':'')
       +((alive&&lowRes(c))?'<span class="lowr" title="实测分辨率不到 720P，码率再高画面也细不了">分辨率低</span>':'')
-      +'</div>'
-      +'</div>';
-  });
-  rows.innerHTML=html;
-  updCount();
+    +'</div>'
+    +epgHtml(c)
+    +'<div class="spd">'+(alive&&sp>0
+        ?'<span class="n'+(smoothEnough(c)?"":" slow")+'">'+sp+'</span><small>KB/s</small>'
+        :'<small>—</small>')+'</div>'
+    +'<div class="c-star"><button class="star'+(isFav(c)?" on":"")+'" data-fav="'+esc(c.key)+'"'
+      +' title="'+(isFav(c)?"取消收藏":"收藏这个频道")+'">'+(isFav(c)?"★":"☆")+'</button></div>'
+    +'</div>';
 }
+var renderToken=0;
 
 function updCount(){
   var list=filtered(), n=0;
   list.forEach(function(c){ if(sel.has(c.key)) n++ });
   $("selN").textContent=n;
   $("selT").textContent=list.length;
+  $("favN").textContent=favCount();
   var all=list.length>0 && n===list.length;
-  var ck=$("ckAll"); ck.checked=all; ck.indeterminate=(n>0&&!all);
-  var bs=$("btnSave"); if(bs){ bs.disabled = n===0; bs.title = n? "保存已勾选的频道" : "先勾选要保存的频道"; }
+  var ck=$("ckAll"); if(ck){ ck.checked=all; ck.indeterminate=(n>0&&!all); }
+  var bs=$("btnSave");
+  if(bs){ bs.disabled = (!favOnly && n===0); bs.title = favOnly ? "保存全部收藏频道" : (n? "保存已勾选的频道" : "先勾选要保存的频道"); }
+  var hint=$("expHint");
+  if(hint){
+    var k=exportKeys().length;
+    hint.innerHTML = favOnly
+      ? ('将导出 <b>'+k+'</b> 个收藏频道（★）')
+      : ('将导出 <b>'+k+'</b> 个已勾选频道'+(grp?('（分组：'+esc(grp)+'）'):''));
+  }
 }
 
+/* ---------------- 数据 ---------------- */
+var selLoaded2=false, chLoading=false, chReady=false;
 function loadChannels(){
+  if(chLoading) return;
+  chLoading=true;
+  if(!CH.length) skeleton();
   fetch("/api/channels").then(function(r){return r.json()}).then(function(d){
+    chLoading=false;
     CH=d.channels||[];
-  // 列表可能比"实测可用"少(隐藏了地级台/低码率)，卡片跟着列表走，避免数字对不上
-  if(CH.length){ $("sChan").textContent=CH.length; $("sChanLb").textContent="列表内可用频道"; }
+    loadedOnce=true; dirty=true;
+    favSet=new Set();
+    CH.forEach(function(c){ if(c.fav) favSet.add(c.key) });
+    (d.favourites||[]).forEach(function(k){ favSet.add(k) });
     sel=new Set();          // 每次打开都从"一个都不勾"开始，由用户自己挑；也不继承上次的勾选
-    selLoaded=true;
+    selLoaded2=true;
     if(d.save_dir && !$("outdir").value) $("outdir").value=d.save_dir;
-    renderChips(); renderRows();
-    dirty=true;
-  }).catch(function(){ toast("读取频道失败，稍后重试") });
-}
-var selLoaded=false;
-function loadSelSilent(){
-  if(selLoaded) return true;
-  selLoaded=true;
-  return loadSel();
+    renderChips(); renderQ(); renderRows();
+    loadEpg();
+  }).catch(function(){ chLoading=false; loadedOnce=true; renderRows(); toast("读取频道失败，稍后重试") });
 }
 
 function loadStatus(){
   fetch("/api/status").then(function(r){return r.json()}).then(function(s){
     VERSION=s.version; $("verPill").textContent="v"+s.version;
-    // 保存目录一开始就填好（默认在桌面），别让用户看到空框再以为是别的盘
     if(s.desktop) DESKTOP=s.desktop;
     if(s.legal_ack===0 && $("legalBar")) $("legalBar").hidden=false;
     if(s.save_path && !$("outdir").value){
       var sp=String(s.save_path), i=Math.max(sp.lastIndexOf("\\"), sp.lastIndexOf("/"));
       if(i>0){
         $("outdir").value=sp.slice(0,i);
-        // 文件名也跟着实际保存位置走，否则「保存」会另写一份(桌面出现两个 m3u)
         if(!window.__fnInit){ $("fname").value=sp.slice(i+1)||"直播源.m3u"; window.__fnInit=1; }
       }
     }
-    var dot=$("stDot"), txt=$("stTxt");
+    // 频道缓存由后端后台线程读：读完（channels_ready）再拉列表 —— 首屏不被它拖住
+    if(s.channels_ready && !chReady){ chReady=true; loadChannels(); }
+    var dot=$("stDot"), txt=$("stTxt"), pill=$("stPill");
     if(s.updating){
       dot.className="ti run"; txt.textContent=s.phase||"更新中";
+      pill.className="pill";
       $("progwrap").classList.add("show");
       var p=s.total?Math.round(s.done*100/s.total):3;
       $("prog").style.width=Math.max(3,Math.min(100,p))+"%";
-      $("btnUpdate").disabled=true;
+      $("btnUpdate").disabled=true; $("btnUpdate").textContent="更新中…";
     }else{
       dot.className="ti"; txt.textContent="就绪";
+      pill.className="pill";
       $("progwrap").classList.remove("show"); $("prog").style.width="0";
-      $("btnUpdate").disabled=false;
-      if(s.error){ dot.className="ti off"; txt.textContent="上次更新失败"; }
+      if($("btnUpdate").disabled){ $("btnUpdate").disabled=false; }
+      $("btnUpdate").textContent="立即更新";
+      if(s.error){ dot.className="ti off"; txt.textContent="上次更新失败"; pill.className="pill"; }
     }
-    if(s.stats){
-      $("sChan").textContent=s.stats.live||0;
-      $("sSrc").textContent=s.stats.channels||0;
-      $("sHkmt").textContent=s.stats.hkmt||0;
+    var st=s.stats||{};
+    if(st.channels){
+      $("sRate").textContent=Math.round((st.live||0)*100/st.channels)+"%";
+      $("sChanD").textContent="去重后共 "+(st.channels||0)+" 个";
     }
-    $("sTime").textContent=friendly(s.last_update);
+    $("sTime").innerHTML=statVal(friendly(s.last_update));
+    $("sTimeD").textContent=nextText(s.next_update);
     if(s.tray===false && !window._trayWarn){ window._trayWarn=1; }
-    // 打开页面时不要直接铺出上次缓存的结果：必须是这一轮跑完，才把实测结果列出来
     if(s.updating){ wasUpdating=true; }
     if(!s.updating && wasUpdating){
-      wasUpdating=false; fresh=true; lastLoaded=s.last_update||"";
+      wasUpdating=false; fresh=true;
       loadChannels();
-      toast("更新完成："+(s.stats&&s.stats.live||0)+" 个频道实测可用");
+      toast("更新完成："+(st.live||0)+" 个频道实测可用");
     }
+    if(CH.length){
+      $("sChan").textContent=CH.length;
+      var cl=0; CH.forEach(function(c){ if(c.clear) cl++ });
+      $("sRateD").textContent="清晰 "+cl+" 条 · 收藏 "+favCount();
+    }else if(st.live!==undefined){
+      $("sChan").textContent=st.live||0;
+    }
+    $("sHkmt").textContent=(st.hkmt||0);
   }).catch(function(){});
+}
+/* 数字卡的"数字 + 单位"：数字保持 24px，单位走 .stat .v small 的 12px。
+   "10 分钟前"整串 24px 时，和旁边 86 / 62 / 48% 完全不是一个量级。 */
+function statVal(txt){
+  var m=/^(\d+)\s*(分钟前|小时前)$/.exec(String(txt==null?"":txt));
+  if(!m) return esc(txt);
+  return m[1]+'<small>'+esc(m[2])+'</small>';
 }
 function friendly(t){
   if(!t) return "-";
@@ -4114,23 +5421,127 @@ function friendly(t){
   if(diff<1440) return Math.round(diff/60)+" 小时前";
   return (d.getMonth()+1)+"/"+d.getDate()+" "+("0"+d.getHours()).slice(-2)+":"+("0"+d.getMinutes()).slice(-2);
 }
+function nextText(nx){
+  var t=+((nx||0)||0);
+  if(!t) return "下次自动更新 —";
+  var m=Math.round((t*1000-Date.now())/60000);
+  if(m<=0) return "下次自动更新：马上";
+  if(m<60) return "下次 "+m+" 分钟后";
+  return "下次 "+Math.round(m/60)+" 小时后";
+}
 
-/* ---- 交互 ---- */
-$("q").addEventListener("input",function(){ q=this.value; renderRows() });
+/* ---------------- 收藏 ---------------- */
+function setFav(key,name,on,btn){
+  fetch("/api/favourites",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({key:key,name:name,on:on})})
+    .then(function(r){return r.json()}).then(function(d){
+      if(!d.ok) return toast(d.msg||"收藏失败");
+      if(d.fav) favSet.add(key); else favSet.delete(key);
+      CH.forEach(function(c){ if(c.key===key) c.fav=d.fav });
+      if(btn){ btn.textContent=d.fav?"★":"☆"; btn.classList.toggle("on",!!d.fav);
+        btn.title=d.fav?"取消收藏":"收藏这个频道"; }
+      $("favN").textContent=favCount();
+      var fc=$("chips").querySelector('[data-fav="1"]');
+      if(fc) fc.innerHTML="★ 收藏 "+favCount();
+      if(fa && !d.fav) renderRows();
+      toast(d.fav?("已收藏："+name):("已取消收藏："+name));
+      if(favOnly) updCount();
+    }).catch(function(){ toast("收藏请求失败") });
+}
+
+/* ---------------- 导出 ---------------- */
+function exportKeys(){
+  var out=[], g=$("expGrp")?$("expGrp").value:"";
+  if(favOnly){
+    CH.forEach(function(c){ if(isFav(c) && (!g || c.group===g)) out.push(c.key) });
+    return out;
+  }
+  filtered().forEach(function(c){ if(sel.has(c.key) && (!g || c.group===g)) out.push(c.key) });
+  return out;
+}
+function syncFavOnly(v){
+  favOnly=!!v;
+  var ck=$("expFav"); if(ck) ck.checked=favOnly;
+  $("btnFavOnly").classList.toggle("on",favOnly);
+  updCount();
+}
+function doExport(){
+  var dir=$("outdir").value.trim(), fn=$("fname").value.trim()||"直播源.m3u";
+  var keys=exportKeys();
+  if(!keys.length){
+    return toast(favOnly? "还没有收藏频道：点表格右侧的 ☆ 收藏几个" : "还没有选频道：勾选几个，或点「全选」");
+  }
+  if(!dir) return toast("请先填保存目录（在「导出设置…」里选一下）");
+  var b=$("btnSave"), g=$("btnExpGo");
+  if(b) b.disabled=true; if(g){ g.disabled=true; g.textContent="保存中…"; }
+  fetch("/api/export",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({keys:keys,dir:dir,filename:fn,fav_only:favOnly})})
+    .then(function(r){return r.json()}).then(function(d){
+      if(b) b.disabled=false; if(g){ g.disabled=false; g.textContent="保存 M3U"; }
+      if(!d.ok) return toast(d.msg||"保存失败");
+      var m="已保存 "+d.count+" 个频道到 "+d.path;
+      if(d.skipped) m+="（"+d.skipped+" 个频道当前没有可用源，已跳过）";
+      toast(m,4200);
+      closeExp();
+    }).catch(function(){
+      if(b) b.disabled=false; if(g){ g.disabled=false; g.textContent="保存 M3U"; }
+      toast("保存请求失败");
+    });
+}
+function openExp(){
+  fillExpGrp();
+  $("expMask").classList.add("show");
+  updCount();
+}
+function closeExp(){ $("expMask").classList.remove("show") }
+function fillExpGrp(){
+  var selEl=$("expGrp"), cur=selEl.value, gs=[], seen={};
+  CH.forEach(function(c){ if(!seen[c.group]){seen[c.group]=1;gs.push(c.group)} });
+  gs.sort(function(a,b){
+    var ia=GORDER.indexOf(a), ib=GORDER.indexOf(b);
+    return (ia<0?99:ia)-(ib<0?99:ib);
+  });
+  var h='<option value="">全部（按勾选 / 只导收藏）</option>';
+  gs.forEach(function(g){ h+='<option value="'+esc(g)+'">只导「'+esc(g)+'」</option>' });
+  selEl.innerHTML=h;
+  if(cur) selEl.value=cur;
+}
+
+/* ---------------- 交互 ---------------- */
+$("q").addEventListener("input",function(){ kw=this.value; renderRows() });
 try{ var _sk=localStorage.getItem("livesort"); if(_sk) sk=_sk }catch(e){}
 $("sort").value=sk;
 $("sort").addEventListener("change",function(){ sk=this.value; try{localStorage.setItem("livesort",sk)}catch(e){}; renderRows() });
 $("chips").addEventListener("click",function(e){
   var b=e.target.closest(".chip"); if(!b) return;
-  grp=b.dataset.g||""; renderChips(); renderRows();
+  /* 【2026-10-25 用户「点击相关的栏目，不能正确显示频道」】
+     第一排（全部 / ★收藏 / 央视 / 卫视 / 香港 …）在界面上是**同一排互斥的分类**，
+     代码里却是两个各自独立的开关：grp 和 fa 会叠加成"且"。
+     现场：先点「★ 收藏 3」再点「央视」→ 列表只剩 1 条（央视里那 1 个收藏）；
+     点「电影」「少儿」「台湾」「国际·综合」→ 0 条，满屏"没有符合条件的频道"，
+     看着就是点了栏目不显示频道。而且「全部」的选中态只看 grp，收藏开着时
+     它和收藏会同时高亮。
+     改成一排单选：点分类就切到那个分类（收藏也是一个分类），再点当前分类=取消回全部。
+     第二排（达标/仅看清晰/网络/有问题）是画质条件，仍与分类相与，不动。 */
+  if(b.dataset.fav){
+    fa=!fa; grp="";
+  } else {
+    var g=b.dataset.g||"";
+    if(g && grp===g) grp="";      // 再点一次当前栏目 = 取消，回到全部
+    else grp=g;
+    fa=false;
+  }
+  renderChips(); renderQ(); renderRows();
 });
 $("chipsQ").addEventListener("click",function(e){
   var b=e.target.closest(".chip"); if(!b) return;
   if(b.dataset.r!==undefined){
-    rf=(rf===b.dataset.r)?"":b.dataset.r;
-    qf=""; sf="";                                   // 分辨率筛与"清晰/码率"互斥，免得筛出 0 条
+    rf=(rf===b.dataset.r)?"":b.dataset.r; qf=""; sf="";
   } else if(b.dataset.q!==undefined){
     qf=(qf===b.dataset.q)?"":b.dataset.q; rf=""; sf="";
+  } else if(b.dataset.f!==undefined){
+    /* 达标 / 仅看清晰：v1.4.1 这里漏了这个分支，两个 chip 点了没反应（顺手修掉） */
+    qf=(qf===b.dataset.f)?"":b.dataset.f; rf=""; sf="";
   } else if(b.dataset.s!==undefined){
     sf=sf?"":"1"; rf=""; qf="";
   } else {
@@ -4139,28 +5550,35 @@ $("chipsQ").addEventListener("click",function(e){
   renderQ(); renderRows();
 });
 $("rows").addEventListener("click",function(e){
+  var st=e.target.closest("button.star");
+  if(st){
+    var k=st.dataset.fav, name="";
+    CH.forEach(function(c){ if(c.key===k) name=c.name });
+    setFav(k,name,!st.classList.contains("on"),st);
+    return;
+  }
   var ck=e.target.closest("input[data-ck]"); if(!ck) return;
-  var k=ck.dataset.ck;
-  if(ck.checked) sel.add(k); else sel.delete(k);
-  saveSel(); updCount();
-  var tr=ck.closest(".tr"); if(tr) tr.style.background="";
+  var key=ck.dataset.ck;
+  if(ck.checked) sel.add(key); else sel.delete(key);
+  updCount();
 });
 $("ckAll").addEventListener("change",function(){
   var list=filtered();
   if(this.checked) list.forEach(function(c){sel.add(c.key)});
   else list.forEach(function(c){sel.delete(c.key)});
-  saveSel(); renderRows();
+  renderRows();
 });
 $("btnAll").addEventListener("click",function(){
-  filtered().forEach(function(c){sel.add(c.key)}); saveSel(); renderRows();
+  filtered().forEach(function(c){sel.add(c.key)}); renderRows();
 });
 $("btnInv").addEventListener("click",function(){
   filtered().forEach(function(c){ if(sel.has(c.key)) sel.delete(c.key); else sel.add(c.key) });
-  saveSel(); renderRows();
+  renderRows();
 });
 $("btnUpdate").addEventListener("click",function(){
   var b=this; b.disabled=true; b.textContent="更新中…";
-  CH=[]; sel=new Set(); fresh=false; wasUpdating=false; renderChips(); renderRows();
+  CH=[]; sel=new Set(); fresh=false; wasUpdating=false; loadedOnce=true;
+  renderChips(); renderQ(); renderRows();
   fetch("/api/update",{method:"POST"}).then(function(r){return r.json()}).then(function(d){
     if(!d.ok) toast(d.msg||"更新启动失败");
     else toast("已开始更新：抓取源 → 测速 → 挑最佳源，请稍候");
@@ -4168,24 +5586,20 @@ $("btnUpdate").addEventListener("click",function(){
     setTimeout(function(){b.textContent="立即更新";},1500);
   });
 });
-$("btnSave").addEventListener("click",function(){
-  var keys=Array.from(sel), dir=$("outdir").value.trim(), fn=$("fname").value.trim()||"直播源.m3u";
-  if(!keys.length) return toast("还没有选频道：勾选几个，或点「全选」");
-  if(!dir) return toast("请先填保存目录（或点「选目录」）");
-  var b=this; b.disabled=true;
-  fetch("/api/export",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({keys:keys,dir:dir,filename:fn})})
-    .then(function(r){return r.json()}).then(function(d){
-      b.disabled=false;
-      if(!d.ok) return toast(d.msg||"保存失败");
-      var m="已保存 "+d.count+" 个频道到 "+d.path;
-      if(d.skipped) m+="（"+d.skipped+" 个频道当前没有可用源，已跳过）";
-      toast(m,4200);
-    }).catch(function(){ b.disabled=false; toast("保存请求失败") });
-});
+$("btnSave").addEventListener("click",doExport);
+$("btnExpSet").addEventListener("click",openExp);
+$("btnExpX").addEventListener("click",closeExp);
+$("btnExpCancel").addEventListener("click",closeExp);
+$("expMask").addEventListener("click",function(e){ if(e.target===this) closeExp() });
+$("btnExpGo").addEventListener("click",doExport);
+$("expFav").addEventListener("change",function(){ syncFavOnly(this.checked) });
+$("expGrp").addEventListener("change",updCount);
+$("btnFavOnly").addEventListener("click",function(){ syncFavOnly(!favOnly) });
+$("btnTheme").addEventListener("click",toggleTheme);
 $("btnBrowse").addEventListener("click",function(){
   fetch("/api/pickdir",{method:"POST"}).then(function(r){return r.json()}).then(function(d){
     if(d.path) $("outdir").value=d.path;
+    else toast(d.msg||"已取消");
   }).catch(function(){toast("打开目录选择框失败")});
 });
 $("btnFolder").addEventListener("click",function(){
@@ -4195,7 +5609,7 @@ $("btnFolder").addEventListener("click",function(){
     .then(function(){toast("已打开目录")}).catch(function(){toast("打开失败")});
 });
 
-/* ---- 设置 ---- */
+/* ---------------- 设置 ---------------- */
 var SRCS=[];
 function openCfg(){
   fetch("/api/settings").then(function(r){return r.json()}).then(function(c){
@@ -4212,7 +5626,6 @@ function openCfg(){
     $("c_su").checked=!!c.self_update; $("c_sig").checked=c.require_sig!==false;
     $("c_suauto").checked=!!c.update_auto; $("c_url").value=c.update_url||"";
     $("c_suh").value=c.update_check_hours||24; $("c_cur").textContent=VERSION;
-    // 数据源列表按"该用的在前、建议关/已关的在后"排，别让直播间源占着第一屏
     SRCS=(c.source_list||[]).slice().sort(function(a,b){
       var d=(a.def_on?0:1)-(b.def_on?0:1); if(d) return d;
       return ((c.sources[a.key]?0:1)-(c.sources[b.key]?0:1));
@@ -4225,14 +5638,13 @@ function openCfg(){
       $("c_srcs").innerHTML=SRCS.map(function(x){
         var e=st[x.key];
         var on=!!c.sources[x.key];
-        var col=!on?"var(--sub)":(!e?"var(--sub)":(e.ok?"var(--ok)":"var(--bad)"));
+        var col=!on?"var(--txt-3)":(!e?"var(--txt-3)":(e.ok?"var(--ok)":"var(--danger)"));
         var meta;
         if(!on) meta="已关闭";
         else if(!e) meta="上次没参与";
         else if(e.ok) meta="<b>"+e.count+"</b> 条 · "+e.ms+"ms"+(e.fallback?" · 备选":"");
         else meta="抓取失败";
-        var offc=c.sources[x.key]?"":" off";
-        return '<label class="src'+offc+'"><input type="checkbox" data-src="'+esc(x.key)+'"'+(c.sources[x.key]?" checked":"")+'>'
+        return '<label class="src'+(on?"":" off")+'"><input type="checkbox" data-src="'+esc(x.key)+'"'+(on?" checked":"")+'>'
           +'<i class="st" style="background:'+col+'"></i><span class="n">'+esc(x.name)+'</span>'
           +'<span class="m">'+meta+'</span></label>';
       }).join("");
@@ -4240,8 +5652,6 @@ function openCfg(){
     });
   }).catch(function(){toast("读取设置失败")});
 }
-var VERSION="-", DESKTOP="";
-function useDesktop(){ if(!DESKTOP){ toast("还没拿到桌面路径，稍等一秒再点"); return } $("outdir").value=DESKTOP; }
 function closeCfg(){ $("cfgMask").classList.remove("show") }
 $("btnCfg").addEventListener("click",openCfg);
 $("btnCfgX").addEventListener("click",closeCfg);
@@ -4253,9 +5663,9 @@ $("btnCfgSave").addEventListener("click",function(){
   var body={
     interval_hours:+$("c_int").value, backups:+$("c_bak").value,
     keep_sd:$("c_sd").checked, filter_junk:$("c_junk").checked, only_tv:$("c_tv").checked,
-      hide_local:$("c_lo").checked,
-      urls_per_channel:(parseInt($("c_urls").value,10)||3),
-      lan:$("c_lan").checked,
+    hide_local:$("c_lo").checked,
+    urls_per_channel:(parseInt($("c_urls").value,10)||3),
+    lan:$("c_lan").checked,
     min_mbps:(parseFloat($("c_min").value)||0),
     output_path:$("c_out").value.trim(),
     epg_url:$("c_epg").value.trim(), open_browser:$("c_browser").checked,
@@ -4265,7 +5675,8 @@ $("btnCfgSave").addEventListener("click",function(){
   };
   fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})
     .then(function(r){return r.json()}).then(function(d){
-      if(d.ok){ toast("设置已保存，新的更新间隔从下次开始生效"); closeCfg(); loadStatus(); }
+      if(d.ok){ toast("设置已保存，新的更新间隔从下次开始生效"); closeCfg(); loadStatus();
+        if(body.epg_url){ setTimeout(loadEpg,1500); } }
       else toast(d.msg||"保存失败");
     }).catch(function(){toast("保存失败")});
 });
@@ -4287,34 +5698,126 @@ $("btnSelfCheck").addEventListener("click",function(){
   }).catch(function(){ b.disabled=false; $("selfMsg").textContent="检查失败" });
 });
 
-/* ---- 退出 ---- */
+/* ---------------- 退出 ---------------- */
 $("btnQuit").addEventListener("click",function(){ $("quitMask").classList.add("show") });
 $("btnQuitNo").addEventListener("click",function(){ $("quitMask").classList.remove("show") });
 $("btnQuitYes").addEventListener("click",function(){
   var b=this; b.disabled=true; b.textContent="正在退出…";
   fetch("/api/quit",{method:"POST"}).then(function(){
-    document.body.innerHTML='<div style="height:100vh;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:8px;color:#6b7280;font:14px system-ui"><b style="font-size:18px;color:#1b1f24">LIVE直播源 已退出</b><span>可以关闭这个页面了</span></div>';
+    document.body.innerHTML='<div style="height:100vh;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:8px;color:var(--txt-3);font:var(--fs-body) system-ui"><b style="font-size:18px;color:var(--txt)">LIVE直播源 已退出</b><span>可以关闭这个页面了</span></div>';
   }).catch(function(){
-    document.body.innerHTML='<div style="padding:40px;text-align:center;color:#6b7280">已退出（或后台正在关闭），可以关闭这个页面了。</div>';
+    document.body.innerHTML='<div style="padding:40px;text-align:center;color:var(--txt-3)">已退出（或后台正在关闭），可以关闭这个页面了。</div>';
   });
 });
 
 document.addEventListener("keydown",function(e){
-  if(e.key==="Escape"){ closeCfg(); $("quitMask").classList.remove("show") }
-  if((e.ctrlKey||e.metaKey)&&e.key==="s"){ e.preventDefault(); $("btnSave").click() }
+  if(e.key==="Escape"){ closeCfg(); closeExp(); $("quitMask").classList.remove("show") }
+  if(e.key==="/" && document.activeElement!==$("q")){ e.preventDefault(); $("q").focus() }
+  if((e.ctrlKey||e.metaKey)&&e.key==="s"){ e.preventDefault(); doExport() }
   if((e.ctrlKey||e.metaKey)&&e.key==="f"){ e.preventDefault(); $("q").focus() }
 });
 
-// 打开页面直接显示"最近一次更新"的结果(后台跑完也会自动落到这里)，但一个都不勾选，
-// 由用户自己挑；真正没有任何结果时才显示空提示。
-loadChannels(); loadStatus(); $("btnLegal").addEventListener("click",function(){
+/* ---------------- 启动 ---------------- */
+loadChannels(); loadStatus();
+$("btnLegal").addEventListener("click",function(){
   fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({legal_ack:1})}).then(function(){ $("legalBar").hidden=true; });
 });
 setInterval(loadStatus,2000);
-function showEmpty(){
-  renderChips(); renderRows(); updCount();
-}
+setInterval(tickEpg,30000);                       // 进度条按本地时间走，不额外请求
+setInterval(function(){ if(CH.length) loadEpg(); },300000);   // 节目单 5 分钟问一次（只读缓存）
+</script>
+<!-- ===== 外观：主题三档 + 主色（2026-10-24 四款统一组件） ===== -->
+<style>
+#apFab{z-index:70;width:30px;height:30px;border-radius:50%;flex:none;margin-left:6px;border:1px solid var(--line);background:transparent;color:var(--txt-2);display:grid;place-items:center;cursor:pointer;font-size:13px;padding:0}
+#apFab:hover{color:var(--accent);border-color:var(--accent)}
+#apPop{position:fixed;z-index:71;width:250px;background:var(--card);border:1px solid var(--line-2);
+  border-radius:12px;box-shadow:var(--shadow-2);padding:12px;display:none}
+#apPop.on{display:block}
+.ap-row{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.ap-lab{font-size:11px;color:var(--txt-3);width:30px;flex:none}
+.ap-seg{display:flex;gap:4px;flex:1}
+.ap-seg button{flex:1;height:26px;border-radius:7px;border:1px solid var(--line);background:transparent;
+  color:var(--txt-2);font-size:11px;cursor:pointer;padding:0}
+.ap-seg button.on{background:color-mix(in srgb,var(--accent) 15%,transparent);border-color:var(--accent);color:var(--accent);font-weight:600}
+.ap-sw{display:flex;gap:8px;flex:1}
+.ap-sw button{width:20px;height:20px;border-radius:50%;border:2px solid transparent;cursor:pointer;padding:0;flex:none}
+.ap-sw button.on{border-color:var(--txt)}
+.ap-hint{font-size:10px;color:var(--txt-3);line-height:1.5;margin-top:9px}
+#btnTheme,#themeBtn{display:none!important}
+html[data-accent="blue"]{--accent:#4f8cff;--accent-ink:#04122e}
+html[data-accent="green"]{--accent:#3ecf8e;--accent-ink:#062016}
+html[data-accent="violet"]{--accent:#a78bfa;--accent-ink:#1a1030}
+html[data-accent="amber"]{--accent:#f0b429;--accent-ink:#221603}
+html[data-theme="light"][data-accent="blue"]{--accent:#1a5fd0;--accent-ink:#fff}
+html[data-theme="light"][data-accent="green"]{--accent:#0f9d58;--accent-ink:#fff}
+html[data-theme="light"][data-accent="violet"]{--accent:#6d28d9;--accent-ink:#fff}
+html[data-theme="light"][data-accent="amber"]{--accent:#a86f00;--accent-ink:#fff}
+html[data-accent]{--accent-soft:color-mix(in srgb,var(--accent) 14%,transparent);--accent-line:color-mix(in srgb,var(--accent) 45%,transparent)}
+</style>
+<button id="apFab" title="外观：主题与主色" aria-label="外观">◐</button>
+<div id="apPop" role="dialog" aria-label="外观设置">
+  <div class="ap-row"><span class="ap-lab">主题</span><div class="ap-seg" id="apMode">
+    <button type="button" data-m="auto">跟随系统</button><button type="button" data-m="light">亮色</button><button type="button" data-m="dark">暗色</button>
+  </div></div>
+  <div class="ap-row"><span class="ap-lab">主色</span><div class="ap-sw" id="apAcc">
+    <button type="button" data-a="default" title="品牌色"></button><button type="button" data-a="blue" title="蓝" style="background:#4f8cff"></button><button type="button" data-a="green" title="绿" style="background:#3ecf8e"></button><button type="button" data-a="violet" title="紫" style="background:#a78bfa"></button><button type="button" data-a="amber" title="琥珀" style="background:#f0b429"></button>
+  </div></div>
+  <div class="ap-hint">「跟随系统」随 Windows 亮/暗模式自动切换；选择记在本机，重开仍在。</div>
+</div>
+<script>
+(function(){
+  var R=document.documentElement, K='ui-theme-mode', A='ui-accent';
+  var media=window.matchMedia?window.matchMedia('(prefers-color-scheme: light)'):null;
+  var brand=(getComputedStyle(R).getPropertyValue('--accent')||'').trim()||'#888';
+  function mode(){ try{return localStorage.getItem(K)||'auto'}catch(e){return 'auto'} }
+  function acc(){ try{return localStorage.getItem(A)||'default'}catch(e){return 'default'} }
+  function apply(){
+    var m=mode();
+    var dark = m==='dark' || (m==='auto' && !(media&&media.matches));
+    R.setAttribute('data-theme', dark?'dark':'light');
+    var a=acc();
+    if(a==='default'){ R.removeAttribute('data-accent'); } else { R.setAttribute('data-accent',a); }
+    sync(m,a);
+  }
+  function sync(m,a){
+    var mb=document.querySelectorAll('#apMode button');
+    for(var i=0;i<mb.length;i++) mb[i].classList.toggle('on', mb[i].getAttribute('data-m')===m);
+    var ab=document.querySelectorAll('#apAcc button');
+    for(var j=0;j<ab.length;j++) ab[j].classList.toggle('on', ab[j].getAttribute('data-a')===a);
+    var fab=document.getElementById('apFab');
+    if(fab) fab.textContent = R.getAttribute('data-theme')==='dark' ? '◐' : '◑';
+  }
+  function setMode(m){ try{localStorage.setItem(K,m)}catch(e){} apply(); }
+  function setAcc(a){ try{localStorage.setItem(A,a)}catch(e){} apply(); }
+  var fab=document.getElementById('apFab'), pop=document.getElementById('apPop');
+  var holder=document.querySelector('.top-r')||document.querySelector('.hbar')||document.querySelector('header');
+  if(holder && fab){ holder.appendChild(fab); if(holder.tagName==='HEADER'){ fab.style.position='fixed'; fab.style.top='10px'; fab.style.right='12px'; } }
+  if(fab) fab.addEventListener('click',function(e){ e.stopPropagation();
+    if(!pop.classList.contains('on')){ var r=fab.getBoundingClientRect();
+      pop.style.right='12px'; pop.style.left='auto'; pop.style.top=(r.bottom+8)+'px'; }
+    pop.classList.toggle('on'); });
+  document.addEventListener('click',function(e){ if(pop && !pop.contains(e.target) && e.target!==fab) pop.classList.remove('on'); });
+  document.addEventListener('keydown',function(e){
+    if(e.key==='Escape'){ pop && pop.classList.remove('on'); }
+    if((e.key==='t'||e.key==='T') && !/^(INPUT|TEXTAREA|SELECT)$/.test((e.target.tagName||''))){
+      e.stopImmediatePropagation(); e.preventDefault();
+      setMode(R.getAttribute('data-theme')==='dark'?'light':'dark');
+    }
+  }, true);
+  document.getElementById('apMode').addEventListener('click',function(e){
+    var b=e.target.closest?e.target.closest('button'):null; if(!b) return; setMode(b.getAttribute('data-m'));
+  });
+  document.getElementById('apAcc').addEventListener('click',function(e){
+    var b=e.target.closest?e.target.closest('button'):null; if(!b) return; setAcc(b.getAttribute('data-a'));
+  });
+  var d=document.querySelector('#apAcc button[data-a="default"]'); if(d) d.style.background=brand;
+  if(media && media.addEventListener) media.addEventListener('change',function(){ if(mode()==='auto') apply(); });
+  else if(media && media.addListener) media.addListener(function(){ if(mode()==='auto') apply(); });
+  var forced=null; try{ forced=new URLSearchParams(location.search).get('theme'); }catch(e){}
+  if(forced==='light'||forced==='dark'){ R.setAttribute('data-theme',forced); sync(mode(),acc()); } else { apply(); }
+  window.__uiTheme={mode:mode,accent:acc,setMode:setMode,setAccent:setAcc};
+})();
 </script>
 
 </html>
@@ -4363,6 +5866,11 @@ class Handler(BaseHTTPRequestHandler):
             if not u.startswith(("http://", "https://")):
                 self.send_error(400, "bad logo url")
                 return
+            if not _logo_url_ok(u):
+                # 内存/磁盘里已有的照旧放行；要现抓的必须是公网地址（挡内网跳板）
+                if not (_LOGO_BYTES.get(u) or _logo_from_disk(u)):
+                    self.send_error(403, "logo host not allowed")
+                    return
             data = _LOGO_BYTES.get(u) or _logo_from_disk(u)
             if data is None:
                 # 内存/磁盘都没有：现取一次（带缓存落盘），拿不到就 404，绝不崩溃成 500
@@ -4420,6 +5928,7 @@ class Handler(BaseHTTPRequestHandler):
                 "next_update": st["next_update"], "error": st["error"],
                 "version": VERSION, "self_update_msg": st.get("self_update_msg", ""),
                 "stats": st["stats"], "cached_channels": nch,
+                "channels_ready": bool(st.get("channels_ready")),
                 "source_stats": st.get("source_stats", {}),
                 "tray": bool(_TRAY is not None and _TRAY._ok),
                 "save_path": self.cfg.get("output_path", ""),
@@ -4472,11 +5981,35 @@ class Handler(BaseHTTPRequestHandler):
                 # 网页列表同样过来源闸口，跟 M3U 保持一套
                 lg = _filter_logo(c2.get("logo"))
                 c2["logo"] = ("/logo?u=" + quote(lg, safe="") + "&v=" + _logo_version(lg)) if lg.startswith(("http://", "https://")) else ""
+                c2["fav"] = _fav_is(c)          # 星标状态跟着列表一起下发，前端不用再问一遍
                 out.append(c2)
             channels = out
             return self._json({"channels": channels,
+                               "favourites": [it["key"] for it in _fav_items()],
                                "save_dir": str(Path(self.cfg["output_path"]).parent),
                                "saved_at": self.updater.state["last_update"]})
+        if path == "/api/favourites":
+            items = _fav_items()
+            with self.updater.lock:
+                chs = list(self.updater.channels.values())
+            return self._json({"ok": True, "items": items,
+                               "keys": [it["key"] for it in items],
+                               "count": len(items),
+                               "matched": len(_fav_keys_of(chs))})
+        if path == "/api/epg":
+            # 只读内存缓存：绝不在这里抓网络（抓取在 epg_loop 后台线程里）
+            now = time.time()
+            with self.updater.lock:
+                chs = list(self.updater.channels.values())
+            nxt = {}
+            for c in chs:
+                it = epg_now(c, now)
+                if it and c.get("key"):
+                    nxt[c["key"]] = it
+            meta = _epg_snapshot()
+            return self._json({"ok": bool(meta["ok"]), "now": nxt, "count": len(nxt),
+                               "total": len(chs), "fetched": meta["fetched"],
+                               "url": meta["url"], "msg": meta["msg"], "ts": int(now)})
         if path == "/api/settings":
             return self._json({
                 **{k: v for k, v in self.cfg.items() if k != "sources"},
@@ -4495,16 +6028,22 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
             return
-        if path == "/api/open":
-            p = parse_qs(urlparse(self.path).query).get("path", [""])[0]
-            if p and Path(p).exists():
-                try:
-                    os.startfile(p)  # noqa
-                    return self._json({"ok": True})
-                except Exception as e:
-                    return self._json({"ok": False, "msg": str(e)})
-            return self._json({"ok": False, "msg": "文件不存在"})
+        # 2026-10-24：/api/open 不再挂在 GET 上。GET 是"带外"就能触发的方法
+        # （<img src> / <script src> 都算），拿它去 startfile 等于把"打开任意文件"
+        # 交给浏览器地址栏；页面里只有按钮走 POST，动作一律留到 POST 里做。
         self._json({"ok": False, "msg": "not found"}, 404)
+
+    def _same_origin(self):
+        """写操作的来源闸：浏览器带的 Origin 必须和 Host 一致。
+        本机进程/脚本不带 Origin，照旧放行（它们本来就有本机权限）；
+        网页里的表单/beacon 跨源 POST 一定带别人的 Origin，直接被挡。"""
+        o = (self.headers.get("Origin") or "").strip()
+        if not o:
+            return True
+        try:
+            return (urlparse(o).netloc or "").lower() == (self.headers.get("Host") or "").strip().lower()
+        except ValueError:
+            return False
 
     def do_POST(self):
         path = self.path.split("?")[0]
@@ -4512,6 +6051,8 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(self._body().decode("utf-8") or "{}")
         except Exception:
             data = {}
+        if not self._same_origin():
+            return self._json({"ok": False, "msg": "跨源请求已拒绝"}, 403)
         if path == "/api/quit":
             threading.Timer(0.3, request_quit).start()
             return self._json({"ok": True, "msg": "正在退出"})
@@ -4520,6 +6061,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "msg": "更新已在进行中"})
             threading.Thread(target=self.updater.run_once, daemon=True).start()
             return self._json({"ok": True})
+        if path == "/api/favourites":
+            on = data.get("on") if isinstance(data.get("on"), bool) else None
+            fav, total = _fav_toggle(data.get("key") or "", data.get("name") or "", on)
+            return self._json({"ok": True, "key": data.get("key") or "", "fav": fav,
+                               "count": total, "keys": [it["key"] for it in _fav_items()]})
+        if path == "/api/epg":
+            # 手动刷新节目单：丢给后台线程，立刻返回（界面不会卡住等一个几 MB 的下载）
+            try:
+                threading.Thread(target=epg_refresh, args=(self.cfg,), kwargs={"force": True},
+                                 daemon=True).start()
+                return self._json({"ok": True, "msg": "已开始刷新节目单"})
+            except Exception as e:
+                return self._json({"ok": False, "msg": "刷新失败: %s" % e})
         if path == "/api/export":
             keys = set(data.get("keys") or [])
             dir_ = (data.get("dir") or "").strip()
@@ -4527,10 +6081,20 @@ class Handler(BaseHTTPRequestHandler):
             fn = re.sub(r'[\\/:*?"<>|]', "_", fn) or "直播源.m3u"
             if not fn.lower().endswith(".m3u"):
                 fn += ".m3u"
+            # "只导收藏"：服务端再挡一道（前端就算传错也不会把非收藏的导出去）
+            if data.get("fav_only"):
+                with self.updater.lock:
+                    fav = _fav_keys_of(list(self.updater.channels.values()))
+                keys = (keys & fav) if keys else set(fav)
             if not keys:
-                return self._json({"ok": False, "msg": "没有选择任何频道"})
+                return self._json({"ok": False, "msg": "没有收藏频道" if data.get("fav_only") else "没有选择任何频道"})
             if not dir_:
                 return self._json({"ok": False, "msg": "未指定保存位置"})
+            if not _export_dir_allowed(dir_, self.cfg):
+                # 导出会在目录不存在时把它建出来，所以落点必须框死：
+                # 只能是程序自己的目录，或用户用「选目录…」真去选过的目录。
+                return self._json({"ok": False,
+                                   "msg": "保存位置请用「选目录…」选择（只能存到程序目录或你选过的目录）"})
             try:
                 target = Path(dir_) / fn
                 n_src, _ = self.updater.write_m3u(target, keys=keys)
@@ -4543,6 +6107,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "msg": "保存失败: %s" % e})
         if path == "/api/settings":
             try:
+                _prev_epg = str(self.cfg.get("epg_url") or "").strip()
                 new = {k: data[k] for k in ("interval_hours", "backups", "keep_sd", "filter_junk", "only_tv", "min_mbps", "hide_local", "urls_per_channel", "lan",
                                             "legal_ack",
          "output_path",
@@ -4564,10 +6129,24 @@ class Handler(BaseHTTPRequestHandler):
                     self.cfg["min_mbps"] = 0.0
                 if self.cfg["output_path"]:
                     Path(self.cfg["output_path"]).parent.mkdir(parents=True, exist_ok=True)
-                manage_task(self.cfg["task_registered"], self.cfg["interval_hours"])
-                manage_autostart(self.cfg["autostart"])
+                # 2026-10-24 复检发现的坑：原来每次 POST /api/settings 都会无条件调
+                # manage_task / manage_autostart —— 而这两个函数在参数是 False 时执行的是
+                # schtasks /Delete。于是"只想改个 EPG 地址"这类无关保存，也会按当时配置里的
+                # 布尔值去动系统的计划任务/开机自启；跑测试时拿一份 task_registered=false 的
+                # 配置去存设置，就会把用户机器上已经注册好的计划任务删掉（本次就误删过一次，
+                # 已重新注册）。改成只有客户端真的发了这两项时才动系统。
+                if "task_registered" in data:
+                    manage_task(self.cfg["task_registered"], self.cfg["interval_hours"])
+                if "autostart" in data:
+                    manage_autostart(self.cfg["autostart"])
                 save_cfg(self.cfg)
                 self.updater.cfg = self.cfg
+                # EPG 地址换了：立刻在后台重抓一次（不换地址就等缓存自然到期）
+                if str(self.cfg.get("epg_url") or "").strip() != _prev_epg:
+                    with _EPG_LOCK:
+                        _EPG["next_try"] = 0.0
+                    threading.Thread(target=epg_refresh, args=(self.cfg,),
+                                     kwargs={"force": True}, daemon=True).start()
                 self.updater.state["next_update"] = time.time() + self.cfg["interval_hours"] * 3600
                 sync_tray(self.cfg)      # 设置里开关托盘，立刻生效
                 return self._json({"ok": True})
@@ -4575,16 +6154,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "msg": "保存失败: %s" % e})
         if path == "/api/pickdir":
             p = pick_folder()
+            if p:
+                try:
+                    _PICKED_DIRS.add(str(Path(p).resolve()))
+                except (OSError, ValueError):
+                    _PICKED_DIRS.add(str(p))
             return self._json({"path": p} if p else {"path": "", "msg": "已取消选择"})
         if path == "/api/open":
             p = data.get("path") or ""
-            if p and Path(p).exists():
-                try:
-                    os.startfile(p)  # noqa
-                    return self._json({"ok": True})
-                except Exception as e:
-                    return self._json({"ok": False, "msg": str(e)})
-            return self._json({"ok": False, "msg": "文件不存在"})
+            if not _dir_allowed(p, self.cfg):
+                return self._json({"ok": False,
+                                   "msg": "只能打开程序自己的目录或「选目录…」选过的目录"})
+            try:
+                os.startfile(p)  # noqa
+                return self._json({"ok": True})
+            except Exception as e:
+                return self._json({"ok": False, "msg": str(e)})
         self._json({"ok": False, "msg": "not found"}, 404)
 
 
@@ -4773,15 +6358,24 @@ def _icon_path():
 
 
 def _already_running(cfg):
-    """单实例：本机已有一个控制台在跑时返回它的端口。"""
-    for p in range(int(cfg.get("port", 8899)), int(cfg.get("port", 8899)) + 10):
+    """单实例：本机已有一个控制台在跑时返回它的端口。
+
+    超时口径（2026-10-24 实测）：这台机器对**没在监听**的回环端口是"丢包"而不是
+    "拒绝"，connect 会一直等到超时。原来 10 个端口 × 0.4 秒 = 每次启动白等 4 秒，
+    占冷启动的七成。现在超时压到 0.08 秒，并且遇到第一个超时就收手（后面几个
+    端口命运一样，没必要一个个等）。
+    """
+    base = int(cfg.get("port", 8899))
+    for p in range(base, base + 10):
         s = socket.socket()
-        s.settimeout(0.4)
+        s.settimeout(0.08)
         try:
             s.connect(("127.0.0.1", p))
             return p
+        except socket.timeout:
+            return 0            # 丢包：这条路上不会有人在听，别挨个等
         except OSError:
-            continue
+            continue            # 明确被拒绝：这个端口空着，试下一个
         finally:
             s.close()
     return 0
@@ -5147,9 +6741,27 @@ def main():
         up.run_once()
         return
 
-    if not up.load_cache():
-        threading.Thread(target=up.run_once, daemon=True).start()
-    threading.Thread(target=up.loop, daemon=True).start()
+    # 启动顺序（用户 2026-10-24：面板启动必须快）：
+    #   ① 下面先把 HTTP 服务起起来，GET / 立刻就能返回（此时列表是骨架屏）；
+    #   ② 读频道缓存（实测 1.3 秒，台标配色要逐张看）+ 更新循环 + EPG 全放后台线程，
+    #      谁也不许挡首屏。缓存读完后把 channels_ready 置真，前端据此把列表拉出来。
+    def _boot():
+        try:
+            ok = up.load_cache()
+        except Exception as e:
+            ok = False
+            log("启动加载频道缓存失败: %s" % e)
+        up.state["channels_ready"] = True     # 先放行首屏（没缓存就显示空列表 + 更新进度）
+        try:
+            if not ok:
+                up.run_once()
+        except Exception as e:
+            up.state["error"] = str(e)
+            log("启动后第一轮更新失败: %s" % e)
+        up.loop()
+    threading.Thread(target=_boot, daemon=True).start()
+    # 正在播出(EPG)：后台线程按需抓 XMLTV；首屏不会因为它变慢（缓存不到就显示 —）
+    threading.Thread(target=epg_loop, args=(cfg,), daemon=True).start()
 
     Handler.updater = up
     Handler.cfg = cfg
@@ -5165,8 +6777,9 @@ def main():
     if httpd is None:
         log("无法绑定端口 %d-%d" % (cfg["port"], cfg["port"] + 9))
         sys.exit(1)
-    url = "http://127.0.0.1:%d/" % httpd.server_address[1]
+    # 端口一绑上，页面随时可能进来要 /api/status（那里会读 _SERVER），先赋值再算 url
     _SERVER = httpd
+    url = "http://127.0.0.1:%d/" % httpd.server_address[1]
     log("%s v%s 已启动: %s" % (APP_NAME, VERSION, url))
     log("M3U 保存位置: %s" % cfg["output_path"])
     sync_tray(cfg)

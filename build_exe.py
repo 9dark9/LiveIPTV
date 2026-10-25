@@ -18,11 +18,26 @@ import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SRC = HERE.parent / "src"
+# 2026-10-25: 以前这里 MAIN/PAYLOAD 全指向 ../src，等于"发出去的包 = 开发目录那份"，
+# 改了仓库忘了拷 src 就会静默打出旧代码，而且 src 里还混着 config.json/日志这些运行期文件。
+# 现在代码只从仓库读；../src 降级成"不进版本库的资源目录"（离线台标库、成品图标）。
+ASSETS = HERE.parent / "src"
 ICON = HERE.parent / "builds" / "icon" / "app-E.ico"
-MAIN = SRC / "LIVE直播源.py"
-PAYLOAD = ["_ed25519.py", "_tray.py", "_toast.py", "tray.ico", "tray_busy.ico",
-           "LIVE直播源.ico"]
+MAIN = HERE / "LIVE直播源.py"
+CODE_PAYLOAD = ["_ed25519.py", "_tray.py", "_toast.py", "tray.ico", "tray_busy.ico"]
+ASSET_PAYLOAD = ["LIVE直播源.ico"]
+
+
+def preflight():
+    """打包前先过一致性闸门（页面 PAGE 必须等于 _page.html、主程序可编译）。
+    用 import 而不是 subprocess：同一个解释器，报错直接打在当前输出里，也省一次启动。"""
+    sys.path.insert(0, str(HERE / "tools"))
+    try:
+        import check_page
+    except Exception as e:                     # 工具脚本没了也要说清楚，别默默跳过闸门
+        raise SystemExit("找不到 tools/check_page.py，拒绝打包: %s" % e)
+    if check_page.main([]) != 0:
+        raise SystemExit("一致性检查未通过，拒绝打包")
 
 
 def read_version():
@@ -84,8 +99,12 @@ def main():
 
     version = read_version()
     print("版本号: %s" % version)
+    print("代码来源: %s" % HERE)
 
-    missing = [f for f in [MAIN] + [SRC / p for p in PAYLOAD] if not f.is_file()]
+    preflight()          # 页面与仓库一致性 + 语法：不过就直接拒绝打包
+
+    missing = ([f for f in [MAIN] + [HERE / p for p in CODE_PAYLOAD] if not f.is_file()]
+               + [f for f in [ASSETS / p for p in ASSET_PAYLOAD] if not f.is_file()])
     if missing:
         raise SystemExit("缺文件: " + ", ".join(str(p) for p in missing))
     if not ICON.is_file():
@@ -100,8 +119,10 @@ def main():
         stage = work / "stage"
         stage.mkdir()
         shutil.copy2(MAIN, stage / MAIN.name)
-        for p in PAYLOAD:
-            shutil.copy2(SRC / p, stage / p)
+        for p in CODE_PAYLOAD:
+            shutil.copy2(HERE / p, stage / p)
+        for p in ASSET_PAYLOAD:
+            shutil.copy2(ASSETS / p, stage / p)
         vfile = work / "version.txt"
         make_version_file(vfile, version)
 
@@ -122,6 +143,11 @@ def main():
         # 否则托盘只能退回 exe 的大图标（缩到 16 像素必然糊）。
         for data_name in ("tray.ico", "tray_busy.ico", "LIVE直播源.ico"):
             cmd += ["--add-data", str(stage / data_name) + os.pathsep + "."]
+        # 离线台标库必须随包：真机上没有它就是"全靠联网取图"，取不到就没台标
+        # （2026-10-24 用户反馈"还是有台标没有显示"）。3.6MB/381 张，包体可接受。
+        libs = ASSETS / "logos_lib"
+        if libs.is_dir():
+            cmd += ["--add-data", str(libs) + os.pathsep + "logos_lib"]
         cmd.append(str(stage / MAIN.name))
         print("打包中: %s" % " ".join(cmd))
         r = subprocess.run(cmd, cwd=str(stage))

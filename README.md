@@ -203,8 +203,9 @@ python LIVE直播源.py --no-tray --no-browser --port 9000
 打包：
 
 ```bash
-python tools/build.py             # 产物在 builds/v<版本>/LIVE直播源.exe
-python tools/preflight_release.py # 发版前自检（版本、签名、文档、红线词…）
+python build_exe.py               # 产物在 builds/v<版本>/LIVE直播源.exe（打包前自动过一致性检查）
+python tools/check_page.py --strict-src   # 自检：页面与 _page.html 一致、src 未漂移、语法能过
+python tests/test_logic.py        # 判据单测（缓存守卫、统计口径）
 ```
 
 数据目录：默认 `%APPDATA%\LIVE直播源`；设环境变量 `LIVE_DATA` 可以指到别处（便携 / 测试用）。

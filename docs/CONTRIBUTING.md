@@ -19,11 +19,19 @@
    `绕过` / `翻墙` / `梯子` / `科学上网` / `墙` / `破解` / `屏蔽`。用中性表述：**「不依赖域名解析」「本地线路」「连接失败」「可用性检测」**。
 4. **不要提交**：`config.json`、`channels.json`、`*.m3u` 产物、日志、`builds/`、`dist/`、`*.pyc`。
 5. **不要提交私钥**；签名私钥只在本机，路径走环境变量（见 [CODE_SIGNING_POLICY.md](CODE_SIGNING_POLICY.md)）。
-6. 改动前跑一遍自检：
+6. **页面只有一份**：界面源码是 `_page.html`，`LIVE直播源.py` 里的 `PAGE` 由脚本生成，**不要手改 `PAGE`**。
+   改完页面跑 `python tools/embed_page.py` 嵌回去；`../src` 只是本机跑源码的镜像目录，
+   用 `python tools/sync_src.py` 同步，打包已经不读它（以前 `build_exe.py` 直接打包 `../src`，
+   改了仓库忘拷就会静默发出旧代码）。
+7. 改动前跑一遍自检（两条都是零依赖，几秒跑完）：
 
    ```bash
-   python tools/preflight_release.py
+   python tools/check_page.py --strict-src   # 页面一致性 + src 未漂移 + 语法能过
+   python tests/test_logic.py                # 缓存守卫等判据的纯函数用例
    ```
+
+   `build_exe.py` 打包前会自动跑一次 `check_page.py`，不过就拒绝打包。
+   （这里以前写的是 `tools/preflight_release.py`，本仓库从来没有这个脚本，属于文档说假话。）
 
 ## 提 PR 之前
 
