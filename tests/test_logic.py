@@ -48,6 +48,40 @@ def ch(group="央视", nsrc=1):
     return {"group": group, "sources": [{"url": "http://x/%d" % i} for i in range(nsrc)]}
 
 
+def ssl_sites():
+    """扫源码里每一个 urlopen(...)，返回 [(所在函数名, context 实参名), ...]。
+
+    为什么按 AST 扫而不是数文本：抓列表与升级下载用的是同一个 urlopen 写法，
+    以前一个 _SSL_CTX 通吃 7 处，"哪一处该严格"只存在于注释里。
+    2026-10-26 拆出 _SSL_STRICT（只给自更新通道）之后，得有一条**不联网**的闸门
+    盯着这个分工，别哪天被"顺手统一一下"改回去。
+    """
+    src = io.open(SRC, encoding="utf-8").read()
+    tree = ast.parse(src, filename=SRC)
+    parents = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    out = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            continue
+        if node.func.attr != "urlopen":
+            continue
+        fname, cur = "", node
+        while cur is not None:
+            if isinstance(cur, ast.FunctionDef):
+                fname = cur.name
+                break
+            cur = parents.get(cur)
+        ctx = ""
+        for kw in (node.keywords or []):
+            if kw.arg == "context" and isinstance(kw.value, ast.Name):
+                ctx = kw.value.id
+        out.append((fname, ctx))
+    return out
+
+
 def main():
     f = grab()
     gv, cs = f["guard_verdict"], f["compute_stats"]
@@ -72,6 +106,20 @@ def main():
     check("源总数", st["sources"], 2)
     check("港澳台数", st["hkmt"], 1)
     check("空输入不炸", cs({})["channels"], 0)
+
+    print("-" * 70)
+    print("3. TLS 分工：升级通道严格校验，抓列表/台标/EPG/测流保持宽松")
+    sites = ssl_sites()
+    strict = sorted(n for n, c in sites if c == "_SSL_STRICT")
+    lenient = sorted(n for n, c in sites if c == "_SSL_CTX")
+    check("走 _SSL_STRICT 的就是升级那两处", strict,
+          ["_fetch_bytes", "apply_self_update"])
+    check("升级那两处不再吃 _SSL_CTX",
+          [c for n, c in sites if n in ("_fetch_bytes", "apply_self_update") and c == "_SSL_CTX"], [])
+    check("其余五处仍是 _SSL_CTX", lenient,
+          ["_check_logo", "_epg_fetch", "_grab", "_open", "one"])
+    check("每个 urlopen 都显式写了 context（没有默认裸连）",
+          len([1 for n, c in sites if c not in ("_SSL_CTX", "_SSL_STRICT")]), 0)
 
     print("-" * 70)
     if fails:

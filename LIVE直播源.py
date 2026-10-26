@@ -365,7 +365,16 @@ GROUP_RANK = ["央视", "卫视", "香港", "澳门", "台湾", "体育", "电�
 
 # ---------------------------------------------------------------- 基础工具
 
+# 两个 TLS 上下文, 分工明确(2026-10-26 巡查③):
+#   _SSL_CTX   —— 不验证书。**只**给用户列表 / 台标 / EPG / 流探测这类"抓到就算数"的对外请求用:
+#                 这些源大量是自签证书、过期链、IP 直连, 严格起来界面会一片红, 而它们最坏结果
+#                 只是一张图不显示、一行台标没进度, 不影响程序本体。
+#   _SSL_STRICT —— 系统信任库 + 主机名校验。**只**给自更新通道用(见 _fetch_bytes / apply_self_update):
+#                 那边落下来的是"要替换本程序"的字节, 传输层不验就等于把 docs/SECURITY.md 第 4 条
+#                 (Ed25519 验签 + sha256) 的最后一道前提抹掉 —— 中间人只要 able 送一份
+#                 "自己签的名"就能绕过。签名与哈希自己校验, 信任链交给系统根证书, 两层都要在。
 _SSL_CTX = ssl._create_unverified_context()
+_SSL_STRICT = ssl.create_default_context()
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
       "Accept": "*/*", "Accept-Encoding": "identity"}
 
@@ -6491,8 +6500,9 @@ def _ver_tuple(v):
 
 
 def _fetch_bytes(url, timeout=15):
+    # 升级通道: 严格 TLS(见文件头 _SSL_STRICT 的注释), 不再吃 _SSL_CTX 那份"什么都不验"。
     with urllib.request.urlopen(urllib.request.Request(url, headers=UA),
-                                timeout=timeout, context=_SSL_CTX) as r:
+                                timeout=timeout, context=_SSL_STRICT) as r:
         return r.read()
 
 
@@ -6659,8 +6669,9 @@ def apply_self_update(info, args):
     tmp = None
     try:
         log("开始下载新版本 %s …" % info.get("version"))
+        # 替换本程序的那一份字节: 严格 TLS(见 _SSL_STRICT 注释), 与 _fetch_bytes 同一口径。
         with urllib.request.urlopen(urllib.request.Request(url, headers=UA),
-                                    timeout=180, context=_SSL_CTX) as r:
+                                    timeout=180, context=_SSL_STRICT) as r:
             data = r.read()
         if len(data) < 1024 * 100:
             raise ValueError("下载文件过小(<100KB)，疑似无效")
