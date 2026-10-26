@@ -22,7 +22,11 @@ HERE = Path(__file__).resolve().parent
 # 改了仓库忘了拷 src 就会静默打出旧代码，而且 src 里还混着 config.json/日志这些运行期文件。
 # 现在代码只从仓库读；../src 降级成"不进版本库的资源目录"（离线台标库、成品图标）。
 ASSETS = HERE.parent / "src"
-ICON = HERE.parent / "builds" / "icon" / "app-E.ico"
+# 2026-10-26: 图标改取 ../src/LIVE直播源.ico —— 根 README 第 23 行写明它就是
+# builds\icon\app-E.ico 的那一份, 而 app-E.ico 是 make_icon.py 不产出的未入库中间产物
+# (脚本只产 app-A/B/C)。上一次清理把它当"icon 草稿"删掉后, 打包在下面的 ICON.is_file()
+# 处直接 raise「缺图标」, 等于自己把发版门堵住。改成取已经随包带的 src 那份, 少一个隐性输入。
+ICON = ASSETS / "LIVE直播源.ico"
 MAIN = HERE / "LIVE直播源.py"
 CODE_PAYLOAD = ["_ed25519.py", "_tray.py", "_toast.py", "tray.ico", "tray_busy.ico"]
 ASSET_PAYLOAD = ["LIVE直播源.ico"]
@@ -108,7 +112,9 @@ def main():
     if missing:
         raise SystemExit("缺文件: " + ", ".join(str(p) for p in missing))
     if not ICON.is_file():
-        raise SystemExit("缺图标: %s（先跑 tools\\make_icon.py）" % ICON)
+        # 2026-10-26: 原来这句提示让人去跑 tools\make_icon.py，但那脚本只产 app-A/B/C，
+        # 产不出这里要的图标 —— 报错了照着提示跑还是"缺图标"。改成直接说要放哪个文件。
+        raise SystemExit("缺图标: %s（把成品图标放到 ../src/ 下，文件名 %s）" % (ICON, ICON.name))
 
     out_dir = HERE.parent / "builds" / ("v" + version)
     out_dir.mkdir(parents=True, exist_ok=True)

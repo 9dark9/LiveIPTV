@@ -352,17 +352,31 @@ label.ck{display:flex;align-items:center;gap:8px;min-height:32px;color:var(--txt
    2026-10-24：右下角「外观」面板存的是 ui-theme-mode / ui-accent，旧版顶栏按钮存的是 livetheme。
    这里两个都读、新键优先——原来只读 livetheme，面板里选了"亮色"刷新后会被旧键拽回暗色，
    页面正文（页尾那套）再改回来，等于闪一下、而且面板的选择形同没生效。 */
+/* 2026-10-26 统一口径（深夜体检第 4 条）：
+   ① ?theme= 以前有两套匹配器 —— 正文那套（旧 :364/:577）用正则且只认前四个字符，
+      面板那套（旧 :1501）用 URLSearchParams，遇到 ?theme=darkish 这类畸形参数两边结论不同；
+      现在合成 urlTheme() 一个函数，四字符后必须是 &/#/结尾才算数。
+   ② themeMode() 以前不把旧值 "system" 归一成 "auto"（applyTheme 按跟随系统处理，显示是对的，
+      但分段控件回显会说错话）；现在由 normMode() 统一归一，读到旧值就地写回。 */
+function urlTheme(){
+  try{
+    var m=/[?&]theme=(dark|light)(?=&|#|$)/.exec(location.search);
+    return m?m[1]:null;
+  }catch(e){ return null }
+}
+function normMode(m){ return (m==="dark"||m==="light") ? m : "auto" }
 (function(){
   try{
-    var m=localStorage.getItem("ui-theme-mode")||localStorage.getItem("livetheme")||"auto";
-    if(m==="system") m="auto";
-    /* 只有旧键的人（早期顶栏按钮切过主题）在这里一次性搬到新键：
-       页尾"外观"面板那套只认 ui-theme-mode，不搬的话它会把旧键的选择当没有、按系统重来一遍。 */
-    if(!localStorage.getItem("ui-theme-mode")&&localStorage.getItem("livetheme"))
-      localStorage.setItem("ui-theme-mode",m);
+    var key=localStorage.getItem("ui-theme-mode");
+    var raw=key||localStorage.getItem("livetheme")||"auto";
+    var m=normMode(raw);
+    /* 归一后和存的不一样（老值 "system"），或只有旧键 livetheme —— 都落到新键，
+       下次不用再猜一遍；页尾"外观"面板那套只认 ui-theme-mode，不搬的话它会把旧键的
+       选择当没有、按系统重来一遍。 */
+    if(m!==raw || !key) localStorage.setItem("ui-theme-mode",m);
     var d=(m==="dark")||(m==="auto"&&window.matchMedia&&matchMedia("(prefers-color-scheme: dark)").matches);
-    var q=/[?&]theme=(dark|light)/.exec(location.search);
-    if(q) d=(q[1]==="dark");
+    var q=urlTheme();
+    if(q) d=(q==="dark");
     document.documentElement.dataset.theme=d?"dark":"light";
     var a=localStorage.getItem("ui-accent")||"default";
     if(a!=="default") document.documentElement.dataset.accent=a;
@@ -574,7 +588,7 @@ var CH=[], EPG={}, sel=new Set(), favSet=new Set();
 var grp="", rf="", qf="", qk="", sf="", kw="", sk="hot", fa=false, favOnly=false;
 var VERSION="-", DESKTOP="", selLoaded=false, dirty=false, fresh=false, wasUpdating=false;
 var loadedOnce=false, epgTimer=null;
-var URLTHEME=/[?&]theme=(dark|light)/.exec(location.search);   // ?theme= 只影响本次显示（截图/验收用）
+var URLTHEME=urlTheme();   // ?theme= 只影响本次显示（截图/验收用）；取归一后的 'dark'/'light'，没有就是 null
 var GORDER=["央视","卫视","香港","澳门","台湾","体育","电影","少儿","游戏","国际·综合","地方台","其他"];
 var $=function(id){return document.getElementById(id)};
 
@@ -591,12 +605,18 @@ function esc(s){
 /* ---------------- 主题 ---------------- */
 function sysDark(){ return !!(window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches) }
 function themeMode(){
-  /* 新键（外观面板）优先，旧键 livetheme 兼容；两个键写的是同一套值，见 toggleTheme */
-  try{ return localStorage.getItem("ui-theme-mode")||localStorage.getItem("livetheme")||"auto" }catch(e){ return "auto" }
+  /* 新键（外观面板）优先，旧键 livetheme 兼容；两个键写的是同一套值，见 toggleTheme。
+     normMode 负责把历史遗留的 "system" 归一成 "auto"，并就地写回，别让它再出来一次。 */
+  try{
+    var raw=localStorage.getItem("ui-theme-mode")||localStorage.getItem("livetheme")||"auto";
+    var m=normMode(raw);
+    if(m!==raw) localStorage.setItem("ui-theme-mode",m);
+    return m;
+  }catch(e){ return "auto" }
 }
 function applyTheme(mode){
   var th = (mode==="dark"||mode==="light") ? mode : (sysDark() ? "dark" : "light");
-  if(URLTHEME) th = URLTHEME[1];
+  if(URLTHEME) th = URLTHEME;
   document.documentElement.dataset.theme = th;
   var b=$("btnTheme");
   if(b) b.title = "切换明暗（当前：" + (mode==="auto"?"跟随系统 · ":"") + (th==="dark"?"暗色":"亮色") + "）";
@@ -606,7 +626,7 @@ function toggleTheme(){
   try{ localStorage.setItem("livetheme", next); localStorage.setItem("ui-theme-mode", next) }catch(e){}
   applyTheme(next);
 }
-applyTheme(URLTHEME ? URLTHEME[1] : themeMode());
+applyTheme(URLTHEME || themeMode());
 if(window.matchMedia) window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change",function(){
   if(themeMode()==="auto") applyTheme("auto");
 });
@@ -1454,7 +1474,7 @@ html[data-accent]{--accent-soft:color-mix(in srgb,var(--accent) 14%,transparent)
   var R=document.documentElement, K='ui-theme-mode', A='ui-accent';
   var media=window.matchMedia?window.matchMedia('(prefers-color-scheme: light)'):null;
   var brand=(getComputedStyle(R).getPropertyValue('--accent')||'').trim()||'#888';
-  function mode(){ try{return localStorage.getItem(K)||'auto'}catch(e){return 'auto'} }
+  function mode(){ try{return normMode(localStorage.getItem(K))}catch(e){return 'auto'} }
   function acc(){ try{return localStorage.getItem(A)||'default'}catch(e){return 'default'} }
   function apply(){
     var m=mode();
@@ -1498,8 +1518,8 @@ html[data-accent]{--accent-soft:color-mix(in srgb,var(--accent) 14%,transparent)
   var d=document.querySelector('#apAcc button[data-a="default"]'); if(d) d.style.background=brand;
   if(media && media.addEventListener) media.addEventListener('change',function(){ if(mode()==='auto') apply(); });
   else if(media && media.addListener) media.addListener(function(){ if(mode()==='auto') apply(); });
-  var forced=null; try{ forced=new URLSearchParams(location.search).get('theme'); }catch(e){}
-  if(forced==='light'||forced==='dark'){ R.setAttribute('data-theme',forced); sync(mode(),acc()); } else { apply(); }
+  var forced=urlTheme();   // 与正文同一套判据（旧写法这里用 URLSearchParams，正则那套用的是另一个）
+  if(forced){ R.setAttribute('data-theme',forced); sync(mode(),acc()); } else { apply(); }
   window.__uiTheme={mode:mode,accent:acc,setMode:setMode,setAccent:setAcc};
 })();
 </script>
