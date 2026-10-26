@@ -9,6 +9,7 @@
 import ast
 import io
 import os
+import re
 import sys
 
 SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "LIVE直播源.py")
@@ -82,6 +83,66 @@ def ssl_sites():
     return out
 
 
+PAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "_page.html")
+
+
+def handler_routes():
+    """do_GET / do_POST 各自认领了哪些路径（只认 `path == "/x"` 和 `path.startswith("/x")`）。"""
+    tree = ast.parse(io.open(SRC, encoding="utf-8").read(), filename=SRC)
+    out = {}
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.FunctionDef) and node.name in ("do_GET", "do_POST")):
+            continue
+        got = set()
+        for n in ast.walk(node):
+            if (isinstance(n, ast.Compare) and isinstance(n.left, ast.Name)
+                    and n.left.id == "path"):
+                for op, c in zip(n.ops, n.comparators):
+                    if isinstance(op, ast.Eq) and isinstance(c, ast.Constant) \
+                            and isinstance(c.value, str):
+                        got.add(c.value)
+            if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "startswith"
+                    and isinstance(n.func.value, ast.Name) and n.func.value.id == "path"
+                    and n.args and isinstance(n.args[0], ast.Constant)):
+                got.add(n.args[0].value + "*")
+        out[node.name] = got
+    missing = [k for k in ("do_GET", "do_POST") if k not in out]
+    if missing:
+        raise SystemExit("源码里没有这些方法，测试先失效: %s" % missing)
+    return out
+
+
+def page_calls():
+    """页面里每一个 fetch，按 (方法, 路径) 返回。不写 method 就是 GET。
+
+    只看 fetch 自己的第二个实参（配对花括号那一段），不往后数正文：
+    窗口开大了会把下一个 fetch 的 method 算到头上，把 GET 判成 POST，
+    这条闸门就会朝"永远通过"或"永远失败"漂移。
+    """
+    src = io.open(PAGE, encoding="utf-8").read()
+    out = []
+    for m in re.finditer(r"""fetch\(\s*(['"])(/[^'"]*)\1""", src):
+        url = m.group(2)
+        opts = ""
+        nxt = src.find(",", m.end())
+        brace = src.find("{", m.end())
+        if nxt != -1 and (brace == -1 or nxt < brace) and (nxt - m.end()) <= 4:
+            j = src.find("{", nxt)
+            depth = 0
+            for k in range(j, min(j + 2000, len(src))):
+                if src[k] == "{":
+                    depth += 1
+                elif src[k] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        opts = src[j:k + 1]
+                        break
+        mm = re.search(r"""method:\s*['"](\w+)['"]""", opts)
+        out.append(((mm.group(1).upper() if mm else "GET"), url))
+    return out
+
+
 def main():
     f = grab()
     gv, cs = f["guard_verdict"], f["compute_stats"]
@@ -120,6 +181,27 @@ def main():
           ["_check_logo", "_epg_fetch", "_grab", "_open", "one"])
     check("每个 urlopen 都显式写了 context（没有默认裸连）",
           len([1 for n, c in sites if c not in ("_SSL_CTX", "_SSL_STRICT")]), 0)
+
+    print("-" * 70)
+    print("4. 页面按钮 ↔ 服务端路由：fetch 的方法必须真有人接（不联网）")
+    rt = handler_routes()
+    calls = sorted(set(page_calls()))
+    orphan_get = sorted(u for mth, u in calls if mth == "GET" and u not in rt["do_GET"])
+    orphan_post = sorted(u for mth, u in calls
+                         if mth == "POST" and u not in rt["do_POST"])
+    check("页面里所有 GET fetch 都在 do_GET 里", orphan_get, [])
+    check("页面里所有 POST fetch 都在 do_POST 里", orphan_post, [])
+    # 2026-10-26 实测：1.4.1 控制台点「下载并升级」回 {"ok":false,"msg":"not found"}。
+    # 页面从 v1.3.0 起就是 POST，而这段代码一直只挂在 do_GET 里 —— 升级按钮从来没生效过。
+    # 下面两条就是把这次的坑钉住：按钮接口必须在 do_POST，且不能回到 do_GET
+    # （do_GET 没有 _same_origin() 这道闸，任何页面 <img src=...> 都能触发下载+退出进程）。
+    check("升级接口挂在 do_POST（页面按钮用的就是 POST）",
+          "/api/selfupdate" in rt["do_POST"], True)
+    check("升级接口不在 do_GET（GET 无同源校验，太危险）",
+          "/api/selfupdate" in rt["do_GET"], False)
+    check("POST-only 的接口别被顺手加回 GET",
+          sorted(u for u in ("/api/quit", "/api/open", "/api/pickdir", "/api/export")
+                 if u in rt["do_GET"]), [])
 
     print("-" * 70)
     if fails:

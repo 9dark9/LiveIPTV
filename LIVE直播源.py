@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-LIVE直播源 v1.4.2  —— 本机直播源整理与控制台
+LIVE直播源 v1.4.3  —— 本机直播源整理与控制台
 =================================================
 单文件、零第三方依赖（只用 Python 标准库）。作者：海风（kele551）
 仓库：https://github.com/kele551/LiveIPTV
@@ -72,7 +72,7 @@ except Exception:                            # 托盘是可选功能，拿不到
 
 APP_NAME = "LIVE直播源"
 AUTHOR = "海风（kele551）"
-VERSION = "1.4.2"
+VERSION = "1.4.3"
 REPO_URL = "https://github.com/kele551/LiveIPTV"
 
 # 升级包验签公钥（Ed25519，32 字节十六进制）；对应私钥离线保管，不随仓库分发。
@@ -5974,20 +5974,6 @@ class Handler(BaseHTTPRequestHandler):
                                "enabled": bool(self.cfg.get("self_update")),
                                "url": self.cfg.get("update_url", ""),
                                "msg": ("" if info is None else ("已是最新" if info is False else "发现新版本 v%s" % info["version"]))})
-        if path == "/api/selfupdate":
-            info = check_self_update(self.cfg, force=True)
-            if not info or info is False:
-                return self._json({"ok": False, "msg": "已是最新或未配置更新地址"})
-            res = apply_self_update(info, Handler.argv)
-            if res:
-                if isinstance(res, dict):
-                    if res.get("replacing"):
-                        # 已交给替换脚本：先把回复发出去，再退出本进程让脚本换文件
-                        threading.Timer(1.2, request_quit).start()
-                        return self._json({"ok": True, "replacing": True, "msg": res.get("msg", "")})
-                    return self._json({"ok": True, "manual": True, "path": res.get("path", ""), "msg": res.get("msg", "")})
-                return self._json({"ok": True, "restart": True})
-            return self._json({"ok": False, "msg": "更新失败，详见日志"})
         if path == "/api/channels":
             with self.updater.lock:
                 channels = list(self.updater.channels.values())
@@ -6074,6 +6060,23 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return False
 
+    def _api_selfupdate(self):
+        """「下载并升级」按钮的实现。**只在 do_POST 里挂**：它会下载升级包、覆盖 exe 并重启进程，
+        而 do_GET 没有 _same_origin() 这道闸 —— 与本文件 2026-10-24 把 /api/open 从 GET 摘掉同一条理由。"""
+        info = check_self_update(self.cfg, force=True)
+        if not info or info is False:
+            return self._json({"ok": False, "msg": "已是最新或未配置更新地址"})
+        res = apply_self_update(info, Handler.argv)
+        if res:
+            if isinstance(res, dict):
+                if res.get("replacing"):
+                    # 已交给替换脚本：先把回复发出去，再退出本进程让脚本换文件
+                    threading.Timer(1.2, request_quit).start()
+                    return self._json({"ok": True, "replacing": True, "msg": res.get("msg", "")})
+                return self._json({"ok": True, "manual": True, "path": res.get("path", ""), "msg": res.get("msg", "")})
+            return self._json({"ok": True, "restart": True})
+        return self._json({"ok": False, "msg": "更新失败，详见日志"})
+
     def do_POST(self):
         path = self.path.split("?")[0]
         try:
@@ -6085,6 +6088,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/quit":
             threading.Timer(0.3, request_quit).start()
             return self._json({"ok": True, "msg": "正在退出"})
+        if path == "/api/selfupdate":
+            # v1.4.3 修: 页面按钮一直是 POST, 这段代码以前只在 do_GET 里 —— 按钮从来没通过
+            return self._api_selfupdate()
         if path == "/api/update":
             if self.updater.state["updating"]:
                 return self._json({"ok": False, "msg": "更新已在进行中"})
