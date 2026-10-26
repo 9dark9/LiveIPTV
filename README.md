@@ -66,7 +66,7 @@
 
 | 步骤 | 做什么 |
 |---|---|
-| **① 下载** | 去 [Releases](https://github.com/kele551/LiveIPTV/releases) 拿 `LIVE直播源.exe`，双击即可（单文件，免安装） |
+| **① 下载** | 去 [Releases](https://github.com/kele551/LiveIPTV/releases) 拿 `LiveIPTV.exe`，双击即可（单文件，免安装）。发行页上的附件名是 `LiveIPTV.exe`，和本机打包出来的 `LIVE直播源.exe` 是同一个程序，改不改名都能跑 |
 | **② 更新** | 首次启动会自动跑一次体检；浏览器自动打开控制台 `http://127.0.0.1:8899` |
 | **③ 导出** | 勾选想要的频道（或点「全选」）→ 点「保存 M3U」→ 把生成的 `直播源.m3u` 拖进播放器 |
 
