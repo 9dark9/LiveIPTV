@@ -3,8 +3,8 @@
 
 <h1>LIVE直播源</h1>
 
-<a href="https://github.com/kele551/LiveIPTV/releases" title="点击去下载（GitHub + GitCode 合计 · 实时）"><img alt="Downloads" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fkele551-badge.kele551.workers.dev%2F%3Frepo%3DLiveIPTV%26kind%3Ddownloads&style=flat-square" height="30"></a>
-<a href="https://github.com/kele551/LiveIPTV" title="浏览量 · GitHub 访问计数 · 实时"><img alt="浏览量" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fkele551-badge.kele551.workers.dev%2F%3Frepo%3DLiveIPTV%26kind%3Dviews&style=flat-square" height="30"></a>
+<a href="https://github.com/kele551/LiveIPTV/releases" title="点击去下载（各平台发行版合计 · 实时）"><img alt="Downloads" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fkele551-badge.kele551.workers.dev%2F%3Frepo%3DLiveIPTV%26kind%3Ddownloads&style=flat-square" height="30"></a>
+<a href="https://github.com/kele551/LiveIPTV" title="浏览量 · 各平台访问计数合计 · 实时"><img alt="浏览量" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fkele551-badge.kele551.workers.dev%2F%3Frepo%3DLiveIPTV%26kind%3Dviews&style=flat-square" height="30"></a>
 
 <a href="https://github.com/kele551/LiveIPTV/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square"></a>
 <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-blue?style=flat-square">
@@ -15,17 +15,19 @@
 <a href="https://github.com/kele551/LiveIPTV/network/members"><img alt="GitHub Fork" src="https://img.shields.io/github/forks/kele551/LiveIPTV?style=flat-square&label=GitHub%20Fork&color=blue"></a>
 <a href="https://github.com/kele551"><img alt="Follow Author" src="https://img.shields.io/github/followers/kele551?style=flat-square&logo=github&label=follow%20author&color=blue"></a>
 
-<img alt="Category" src="https://img.shields.io/badge/%E5%88%86%E7%B1%BB-%E5%BA%94%E7%94%A8%E8%BD%AF%E4%BB%B6-blue?style=flat-square">
-<img alt="Zero Deps" src="https://img.shields.io/badge/%E7%AC%AC%E4%B8%89%E6%96%B9%E4%BE%9D%E8%B5%96-%E9%9B%B6-green?style=flat-square">
-<img alt="No Ad" src="https://img.shields.io/badge/%E5%B9%BF%E5%91%8A-%E6%97%A0-brightgreen?style=flat-square">
+<img alt="Category" src="https://img.shields.io/badge/分类-应用软件-blue?style=flat-square">
+<img alt="Single File" src="https://img.shields.io/badge/形态-单文件exe-blue?style=flat-square">
+<img alt="Free" src="https://img.shields.io/badge/费用-免费无广告-brightgreen?style=flat-square">
+<img alt="No Tracking" src="https://img.shields.io/badge/用户数据-不采集不上传-green?style=flat-square">
 
-<a href="https://github.com/kele551/LiveIPTV/releases"><img alt="Download from GitHub" src="https://img.shields.io/badge/%F0%9F%93%A5_%E4%B8%8B%E8%BD%BD-GitHub%E5%8F%91%E5%B8%83%E9%A1%B5-24292f?style=flat-square&logo=github&logoColor=white&labelColor=3d4552"></a>
-<a href="https://github.com/kele551/LiveIPTV"><img alt="Source" src="https://img.shields.io/badge/%F0%9F%93%82_%E6%BA%90%E7%A0%81-GitHub-24292f?style=flat-square&logo=github&logoColor=white&labelColor=3d4552"></a>
+<a href="https://github.com/kele551/LiveIPTV/releases"><img alt="Download from GitHub" src="https://img.shields.io/badge/%F0%9F%93%A5_%E4%B8%8B%E8%BD%BD-GitHub%E4%B8%BB%E6%BA%90-24292f?style=flat-square&logo=github&logoColor=white&labelColor=3d4552"></a>
+<a href="https://github.com/kele551/LiveIPTV"><img alt="GitHub source" src="https://img.shields.io/badge/%F0%9F%90%99_%E6%BA%90%E7%A0%81-GitHub%E4%BB%93%E5%BA%93-24292f?style=flat-square&logo=github&logoColor=white&labelColor=3d4552"></a>
 <a href="https://github.com/kele551/LiveIPTV/issues"><img alt="Issues" src="https://img.shields.io/badge/%F0%9F%90%9E_%E5%8F%8D%E9%A6%88-%E6%8F%90Issue-0969da?style=flat-square&labelColor=3d4552"></a>
 <a href="#支持项目"><img alt="Sponsor" src="https://img.shields.io/badge/%E2%98%95_%E8%B5%9E%E8%B5%8F-%E8%AF%B7%E5%96%9D%E5%92%96%E5%95%A1-ff69b4?style=flat-square&labelColor=3d4552"></a>
 
 <p>📺 <b>直播源整理与可用性检测工具</b>　·　一键跑出一条自己能播的 M3U</p>
-<p>作者 <b>海风（kele551）</b>　·　<a href="https://github.com/kele551/LiveIPTV">GitHub</a>　·　<a href="docs/COMPLIANCE.md">合规声明</a></p>
+
+<p>作者 <b>海风（kele551）</b>　·　<a href="https://github.com/kele551/LiveIPTV">GitHub（主）</a>　·　<a href="docs/README_EN.md">English</a></p>
 </div>
 
 <details>
@@ -214,6 +216,7 @@ python tests/test_logic.py        # 判据单测（缓存守卫、统计口径�
 
 ## 合规与免责
 
+- **免费、无广告、不收费**；**不采集、不上传任何用户数据**：没有账号系统、没有统计上报、没有广告，运行数据只写本机数据目录。
 - 程序**不含任何直播内容**，不存储、不转发、不二次分发；只整理公开可访问的链接并做可用性测试。
 - 所有频道、台标、节目内容的权利归各自权利人；本工具与任何电视台、平台、运营商**没有隶属关系**，也不代表其认可。
 - 内容来自第三方公开列表，其合法性、稳定性、画质不由本工具保证；请遵守所在地法律法规，仅作个人学习与自用。
